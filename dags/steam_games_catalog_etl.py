@@ -309,14 +309,16 @@ def transform_and_load_to_postgres(details_file: str, **context):
         logger.info(f"Successfully upserted {len(prepared_data)} records into steam.ods_games.")
         if failed_appids:
             try:
-                for appid in failed_appids:
-                    cursor.execute("""
-                        INSERT INTO steam.failed_appids (appid, failed_at, retry_count)
-                        VALUES (%s, CURRENT_TIMESTAMP, 1)
-                        ON CONFLICT (appid) DO UPDATE SET 
-                            retry_count = steam.failed_appids.retry_count + 1,
-                            failed_at = CURRENT_TIMESTAMP
-                    """)
+                params_list = [(appid,) for appid in failed_appids]
+                
+                cursor.executemany("""
+                    INSERT INTO steam.failed_appids (appid, failed_at, retry_count)
+                    VALUES (%s, CURRENT_TIMESTAMP, 1)
+                    ON CONFLICT (appid) DO UPDATE SET 
+                        retry_count = steam.failed_appids.retry_count + 1,
+                        failed_at = CURRENT_TIMESTAMP
+                """, params_list)
+                
                 conn.commit()
                 logger.info(f"Saved {len(failed_appids)} failed appids to steam.failed_appids")
             except Exception as e:
