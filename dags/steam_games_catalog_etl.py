@@ -6,12 +6,12 @@ from datetime import datetime, timedelta
 
 import requests
 from airflow import DAG
-from airflow.models.param import Param
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import (
     PythonOperator,
     ShortCircuitOperator,
 )
+from airflow.sdk import Param
 
 # ==========================================
 # КОНФИГУРАЦИЯ
@@ -25,7 +25,7 @@ BASE_PROC_DIR = '/opt/airflow/data/processed/steam_catalog'
 STEAM_APP_LIST_URL = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
 STEAM_APP_DETAILS_URL = "https://store.steampowered.com/api/appdetails/"
 
-POSTGES_CONNECTION_ID = "steam_postgres"
+POSTGRES_CONNECTION_ID = "steam_postgres"
 
 # ==========================================
 # ФУНКЦИИ DAG
@@ -33,43 +33,42 @@ POSTGES_CONNECTION_ID = "steam_postgres"
 
 def check_global_limit(**context) -> bool:
     """
-    ShortCircuit: Проверяет, не превышен ли глобальный лимит игр (10000).
+    ShortCircuit: Проверяет, не превышен ли глобальный лимит игр.
     Если да — DAG успешно завершается, не выполняя следующие таски.
     """
     max_games = context['params'].get('max_games_total', 10000)
     
-    hook = PostgresHook(postgres_conn_id=POSTGES_CONNECTION_ID)
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONNECTION_ID)
     conn = hook.get_conn()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM steam.ods_games;")
-    current_count = cursor.fetchone()[0]
-    cursor.close()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM steam.ods_games;")
+        current_count = cursor.fetchone()[0]
+    finally:
+        cursor.close()
+        conn.close()
     
     logger.info(f"Current games in DB: {current_count}, Max allowed: {max_games}")
     
     if current_count >= max_games:
         logger.info(f"Global limit reached ({current_count} >= {max_games}). Stopping DAG.")
-        return False  # Прерывает выполнение следующих тасок
+        return False
         
-    return True  # Продолжаем выполнение
+    return True
 
 
 def extract_master_app_list(**context) -> str:
     """
     Task 1: Скачивает список AppID из нового Steam API (IStoreService) с пагинацией.
-    Требует наличия переменной STEAM_API_KEY в .env файле.
     """
     ds = context['ds']
     target_dir = os.path.join(BASE_RAW_DIR, ds)
     os.makedirs(target_dir, exist_ok=True)
     file_path = os.path.join(target_dir, 'master_app_list.json')
 
-    # Читаем API ключ из переменных окружения контейнера
     api_key = os.environ.get('STEAM_API_KEY')
     if not api_key:
-        raise ValueError("STEAM_API_KEY не найден в переменных окружения. Проверьте .env файл и перезапустите контейнеры.")
+        raise ValueError("STEAM_API_KEY does not found in the enviroment.")
 
     logger.info("Fetching master app list from Steam IStoreService API...")
     
@@ -130,23 +129,29 @@ def select_unprocessed_batch(master_file: str, **context) -> str:
         all_appids: list[int] = json.load(f)
     
     # 2. Запрашиваем уже загруженные игры из БД (быстро, т.к. PK индекс)
-    hook = PostgresHook(postgres_conn_id=POSTGES_CONNECTION_ID)
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONNECTION_ID)
     conn = hook.get_conn()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT appid FROM steam.ods_games;")
-    existing_appids: set[int] = {row[0] for row in cursor.fetchall()}
-    
-    cursor.execute("SELECT COUNT(*) FROM steam.ods_games;")
-    current_count = cursor.fetchone()[0]
-    
-    cursor.close()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT appid FROM steam.ods_games;")
+        existing_appids: set[int] = {row[0] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT appid FROM steam.failed_appids WHERE retry_count >= 3;")
+        failed_appids: set[int] = {row[0] for row in cursor.fetchall()}
+        
+        cursor.execute("SELECT COUNT(*) FROM steam.ods_games;")
+        current_count = cursor.fetchone()[0]
+    finally:
+        cursor.close()
+        conn.close()
     
     logger.info(f"Already loaded in DB: {len(existing_appids)} games")
     
     # 3. Anti-Join: вычитаем уже загруженные из master list
-    unprocessed_appids = [appid for appid in all_appids if appid not in existing_appids]
+    unprocessed_appids = [
+        appid for appid in all_appids 
+        if appid not in existing_appids and appid not in failed_appids
+    ]
     logger.info(f"Unprocessed games remaining: {len(unprocessed_appids)}")
     
     # 4. Учитываем глобальный лимит: сколько еще можно загрузить
@@ -191,32 +196,40 @@ def fetch_game_details(batch_file_path: str, **context) -> str:
     raw_details = {}
     total = len(appids)
     
+    failed_appids = []
+
     for i, appid in enumerate(appids):
-        url = f"{STEAM_APP_DETAILS_URL}?appids={appid}&l=english"
+        url = f"{STEAM_APP_DETAILS_URL}?appids={appid}&l=english&cc=us"
         try:
             resp = requests.get(url, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-            
             if str(appid) in data and data[str(appid)]['success']:
                 raw_details[appid] = data[str(appid)]['data']
             else:
                 logger.warning(f"AppID {appid} not found or unsuccessful.")
-                
+                failed_appids.append(appid)
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error for appid {appid}: {e}")
+            failed_appids.append(appid)
             
         if (i + 1) % 10 == 0:
             logger.info(f"Progress: {i + 1}/{total} games processed...")
-        time.sleep(1.2)  # Rate limiting
-        
+        time.sleep(1.2)
+
     target_dir = os.path.join(BASE_RAW_DIR, ds, 'details')
     os.makedirs(target_dir, exist_ok=True)
     details_file = os.path.join(target_dir, 'raw_details.json')
     
     with open(details_file, 'w', encoding='utf-8') as f:
         json.dump(raw_details, f, ensure_ascii=False)
-        
+
+    if failed_appids:
+            failed_file = os.path.join(target_dir, 'failed_appids.json')
+            with open(failed_file, 'w') as f:
+                json.dump(failed_appids, f)
+            logger.warning(f"Saved {len(failed_appids)} failed appids to {failed_file}")
+
     logger.info(f"Saved details for {len(raw_details)} games.")
     return details_file
 
@@ -236,52 +249,79 @@ def transform_and_load_to_postgres(details_file: str, **context):
     for appid, game in raw_details.items():
         is_free = game.get('is_free', False)
         
-        price_cents = game.get('price_overview', {}).get('final', 0) if not is_free else 0
+        price_overview = game.get('price_overview') or {}
+        price_cents = price_overview.get('final', 0) if not is_free else 0
         price = float(price_cents) / 100.0
+        currency = price_overview.get('currency', 'USD') if not is_free else 'USD'
         
-        developers = ", ".join(game.get('developers', [])) or None
-        publishers = ", ".join(game.get('publishers', [])) or None
-        genres = ", ".join([g['description'] for g in game.get('genres', [])]) or None
-        release_date = game.get('release_date', {}).get('date') or None
+        developers = ", ".join(game.get('developers') or []) or None
+        publishers = ", ".join(game.get('publishers') or []) or None
+        genres = ", ".join([g.get('description', '') for g in (game.get('genres') or [])]) or None
+        
+        release_date_obj = game.get('release_date') or {}
+        release_date = release_date_obj.get('date') or None
+        
         short_desc = game.get('short_description', '')
-        
         raw_json_str = json.dumps(game)
         
         prepared_data.append((
             int(appid), game.get('name'), is_free, price, developers, 
-            publishers, genres, release_date, short_desc, raw_json_str
+            publishers, genres, release_date, short_desc, raw_json_str, currency
         ))
         
     if not prepared_data:
         logger.warning("No valid data to load.")
         return
 
-    hook = PostgresHook(postgres_conn_id=POSTGES_CONNECTION_ID)
+    failed_file = os.path.join(os.path.dirname(details_file), 'failed_appids.json')
+    failed_appids = []
+    if os.path.exists(failed_file):
+        with open(failed_file, 'r') as f:
+            failed_appids = json.load(f)
+        logger.info(f"Found {len(failed_appids)} failed appids to save")
+
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONNECTION_ID)
     conn = hook.get_conn()
-    cursor = conn.cursor()
     
     query = """
-     INSERT INTO steam.ods_games (
-         appid, name, is_free, price, developers, publishers, 
-         genres, release_date, short_description, raw_json
-     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-     ON CONFLICT (appid) DO UPDATE SET
-         name = EXCLUDED.name,
-         is_free = EXCLUDED.is_free,
-         price = EXCLUDED.price,
-         developers = EXCLUDED.developers,
-         publishers = EXCLUDED.publishers,
-         genres = EXCLUDED.genres,
-         release_date = EXCLUDED.release_date,
-         short_description = EXCLUDED.short_description,
-         raw_json = EXCLUDED.raw_json,
-         updated_at = CURRENT_TIMESTAMP;
- """
+    INSERT INTO steam.ods_games (
+        appid, name, is_free, price, developers, publishers, 
+        genres, release_date, short_description, raw_json, currency
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (appid) DO UPDATE SET
+        name = EXCLUDED.name,
+        is_free = EXCLUDED.is_free,
+        price = EXCLUDED.price,
+        developers = EXCLUDED.developers,
+        publishers = EXCLUDED.publishers,
+        genres = EXCLUDED.genres,
+        release_date = EXCLUDED.release_date,
+        short_description = EXCLUDED.short_description,
+        raw_json = EXCLUDED.raw_json,
+        currency = EXCLUDED.currency,
+        updated_at = CURRENT_TIMESTAMP;
+    """
     
     try:
+        cursor = conn.cursor()
         cursor.executemany(query, prepared_data)
         conn.commit()
         logger.info(f"Successfully upserted {len(prepared_data)} records into steam.ods_games.")
+        if failed_appids:
+            try:
+                for appid in failed_appids:
+                    cursor.execute("""
+                        INSERT INTO steam.failed_appids (appid, failed_at, retry_count)
+                        VALUES (%s, CURRENT_TIMESTAMP, 1)
+                        ON CONFLICT (appid) DO UPDATE SET 
+                            retry_count = steam.failed_appids.retry_count + 1,
+                            failed_at = CURRENT_TIMESTAMP
+                    """)
+                conn.commit()
+                logger.info(f"Saved {len(failed_appids)} failed appids to steam.failed_appids")
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Failed to save failed_appids: {e}")
     except Exception as e:
         conn.rollback()
         logger.error(f"Database error during upsert: {e}")
