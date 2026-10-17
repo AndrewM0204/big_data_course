@@ -292,10 +292,11 @@ def transform_reviews(raw_file: str, **context) -> str:
 
 def load_reviews_mongo(clean_file: str, **context) -> None:
     """
-    Идемпотентная загрузка в steam.ods_reviews: upsert по _id (recommendationid).
-    Повторный запуск не создает дубликаты.
+    Загрузка только новых отзывов в steam.ods_reviews.
+    Отзывы, уже лежащие в коллекции (проверка по _id = recommendationid), пропускаются.
+    Дубликаты внутри одного запуска (одна рецензия пришла с разных страниц) тоже отбрасываются.
     """
-    ops = []
+    docs = {}
     with open(clean_file, 'r', encoding='utf-8') as f:
         for line in f:
             doc = json.loads(line)
@@ -306,10 +307,10 @@ def load_reviews_mongo(clean_file: str, **context) -> None:
             author = doc.get('author') or {}
             if author.get('last_played'):
                 author['last_played'] = datetime.fromisoformat(author['last_played'])
-            doc_id = doc.pop('_id')  # _id не обновляем через $set, только фильтр upsert
-            ops.append(UpdateOne({'_id': doc_id}, {'$set': doc}, upsert=True))
+            # setdefault: оставляем первое вхождение рецензии
+            docs.setdefault(doc['_id'], doc)
 
-    if not ops:
+    if not docs:
         logger.info("No reviews to load into MongoDB.")
         return
 
@@ -319,10 +320,29 @@ def load_reviews_mongo(clean_file: str, **context) -> None:
         collection.create_index([('appid', 1)], name='idx_appid')
         collection.create_index([('timestamp_created', -1)], name='idx_timestamp_created')
 
-        batch_size = 1000
-        for start in range(0, len(ops), batch_size):
-            collection.bulk_write(ops[start:start + batch_size], ordered=False)
-        logger.info(f"Upserted {len(ops)} reviews into {MONGO_DB_NAME}.{MONGO_COLLECTION}.")
+        # Ищем уже загруженные _id батчами, чтобы не тянуть всю коллекцию в память
+        all_ids = list(docs.keys())
+        lookup_batch = 1000
+        existing = set()
+        for start in range(0, len(all_ids), lookup_batch):
+            chunk = all_ids[start:start + lookup_batch]
+            existing.update(
+                d['_id'] for d in collection.find({'_id': {'$in': chunk}}, {'_id': 1})
+            )
+
+        new_docs = [doc for doc_id, doc in docs.items() if doc_id not in existing]
+        logger.info(
+            f"Reviews: {len(docs)} unique in file, {len(existing)} already in MongoDB, "
+            f"{len(new_docs)} new."
+        )
+        if not new_docs:
+            logger.info("All reviews are already loaded; nothing to insert.")
+            return
+
+        insert_batch = 1000
+        for start in range(0, len(new_docs), insert_batch):
+            collection.insert_many(new_docs[start:start + insert_batch], ordered=False)
+        logger.info(f"Inserted {len(new_docs)} new reviews into {MONGO_DB_NAME}.{MONGO_COLLECTION}.")
     finally:
         client.close()
 
