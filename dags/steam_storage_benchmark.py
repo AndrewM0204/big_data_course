@@ -14,7 +14,6 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk import Param
 from airflow.task.trigger_rule import TriggerRule
-from psycopg2.extras import execute_values
 from pymongo import MongoClient
 from requests.auth import HTTPBasicAuth
 
@@ -169,11 +168,19 @@ class PostgresBench:
         self.conn.commit()
 
     def insert(self, payload, batch):
-        sql = f"""INSERT INTO {PG_TABLE} (review_id, appid, game_name, language, voted_up,
-                  votes_up, weighted_vote_score, review_text, timestamp_created) VALUES %s"""
+        # Многострочный INSERT через обычный execute: execute_values из psycopg2 не работает
+        # с соединением psycopg3, которое возвращает PostgresHook новых версий провайдера.
+        # Протокол допускает до 65535 параметров в запросе; при 9 полях берем не больше 5000 строк.
+        chunk = min(batch, 5000)
+        columns = ("(review_id, appid, game_name, language, voted_up, "
+                   "votes_up, weighted_vote_score, review_text, timestamp_created)")
+        row_placeholder = "(" + ", ".join(["%s"] * 9) + ")"
         with self.conn.cursor() as cur:
-            for start in range(0, len(payload), batch):
-                execute_values(cur, sql, payload[start:start + batch], page_size=batch)
+            for start in range(0, len(payload), chunk):
+                part = payload[start:start + chunk]
+                sql = f"INSERT INTO {PG_TABLE} {columns} VALUES " + ", ".join([row_placeholder] * len(part))
+                params = [value for row in part for value in row]
+                cur.execute(sql, params)
         self.conn.commit()
 
     def count(self):
