@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import requests
 from airflow import DAG
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import (
     PythonOperator,
@@ -34,19 +35,16 @@ POSTGRES_CONNECTION_ID = "steam_postgres"
 def check_global_limit(**context) -> bool:
     """
     ShortCircuit: Проверяет, не превышен ли глобальный лимит игр.
-    Если да — DAG успешно завершается, не выполняя следующие таски.
+    Читает результат из XCom от SQLExecuteQueryOperator.
     """
     max_games = context['params'].get('max_games_total', 10000)
     
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONNECTION_ID)
-    conn = hook.get_conn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM steam.ods_games;")
-        current_count = cursor.fetchone()[0]
-    finally:
-        cursor.close()
-        conn.close()
+    # Получаем COUNT(*) из предыдущего SQLExecuteQueryOperator
+    count_result = context['ti'].xcom_pull(task_ids='count_existing_games')
+    if count_result and len(count_result) > 0:
+        current_count = count_result[0][0]
+    else:
+        current_count = 0
     
     logger.info(f"Current games in DB: {current_count}, Max allowed: {max_games}")
     
@@ -59,7 +57,7 @@ def check_global_limit(**context) -> bool:
 
 def extract_master_app_list(**context) -> str:
     """
-    Task 1: Скачивает список AppID из нового Steam API (IStoreService) с пагинацией.
+    Скачивает список AppID из Steam API (IStoreService) с пагинацией.
     """
     ds = context['ds']
     target_dir = os.path.join(BASE_RAW_DIR, ds)
@@ -114,11 +112,9 @@ def extract_master_app_list(**context) -> str:
 
 def select_unprocessed_batch(master_file: str, **context) -> str:
     """
-    Task 2: Anti-Join паттерн.
-    1. Читает master list
-    2. Запрашивает из БД уже загруженные appid
-    3. Вычисляет разницу (только новые игры)
-    4. Берет первые N игр (batch_size)
+    Anti-Join паттерн.
+    Читает существующие appids из XCom,
+    вычисляет разницу и формирует батч.
     """
     ds = context['ds']
     batch_size = context['params'].get('batch_size', 100)
@@ -128,24 +124,16 @@ def select_unprocessed_batch(master_file: str, **context) -> str:
     with open(master_file, 'r') as f:
         all_appids: list[int] = json.load(f)
     
-    # 2. Запрашиваем уже загруженные игры из БД (быстро, т.к. PK индекс)
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONNECTION_ID)
-    conn = hook.get_conn()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT appid FROM steam.ods_games;")
-        existing_appids: set[int] = {row[0] for row in cursor.fetchall()}
-
-        cursor.execute("SELECT appid FROM steam.failed_appids WHERE retry_count >= 3;")
-        failed_appids: set[int] = {row[0] for row in cursor.fetchall()}
-        
-        cursor.execute("SELECT COUNT(*) FROM steam.ods_games;")
-        current_count = cursor.fetchone()[0]
-    finally:
-        cursor.close()
-        conn.close()
+    # 2. Получаем уже загруженные игры из XCom
+    existing_rows = context['ti'].xcom_pull(task_ids='get_existing_appids') or []
+    existing_appids: set[int] = {row[0] for row in existing_rows}
     
-    logger.info(f"Already loaded in DB: {len(existing_appids)} games")
+    failed_rows = context['ti'].xcom_pull(task_ids='get_failed_appids') or []
+    failed_appids: set[int] = {row[0] for row in failed_rows}
+    
+    # Получаем текущий count из XCom
+    count_result = context['ti'].xcom_pull(task_ids='count_existing_games')
+    current_count = count_result[0][0] if count_result else 0
     
     # 3. Anti-Join: вычитаем уже загруженные из master list
     unprocessed_appids = [
@@ -154,13 +142,12 @@ def select_unprocessed_batch(master_file: str, **context) -> str:
     ]
     logger.info(f"Unprocessed games remaining: {len(unprocessed_appids)}")
     
-    # 4. Учитываем глобальный лимит: сколько еще можно загрузить
+    # 4. Учитываем глобальный лимит
     remaining_capacity = max_games - current_count
     effective_batch_size = min(batch_size, remaining_capacity, len(unprocessed_appids))
     
     if effective_batch_size <= 0:
         logger.warning("No games to process (capacity exhausted or all loaded)")
-        # Создаем пустой файл, чтобы следующие таски корректно отработали
         effective_batch_size = 0
         daily_batch = []
     else:
@@ -234,16 +221,19 @@ def fetch_game_details(batch_file_path: str, **context) -> str:
     return details_file
 
 
-def transform_and_load_to_postgres(details_file: str, **context):
+def transform_game_details(details_file: str, **context) -> str:
     """
-    Task 4: Трансформация и Bulk Upsert в PostgreSQL.
+    Парсит сырые данные и готовит их для загрузки в БД.
     """
     with open(details_file, 'r', encoding='utf-8') as f:
         raw_details = json.load(f)
     
     if not raw_details:
-        logger.info("No data to load.")
-        return
+        logger.info("No data to transform.")
+        out_file = os.path.join(os.path.dirname(details_file), 'prepared_data.json')
+        with open(out_file, 'w') as f:
+            json.dump([], f)
+        return out_file
         
     prepared_data = []
     for appid, game in raw_details.items():
@@ -264,16 +254,41 @@ def transform_and_load_to_postgres(details_file: str, **context):
         short_desc = game.get('short_description', '')
         raw_json_str = json.dumps(game)
         
-        prepared_data.append((
-            int(appid), game.get('name'), is_free, price, developers, 
-            publishers, genres, release_date, short_desc, raw_json_str, currency
-        ))
+        prepared_data.append({
+            'appid': int(appid),
+            'name': game.get('name'),
+            'is_free': is_free,
+            'price': price,
+            'developers': developers,
+            'publishers': publishers,
+            'genres': genres,
+            'release_date': release_date,
+            'short_description': short_desc,
+            'raw_json': raw_json_str,
+            'currency': currency
+        })
         
-    if not prepared_data:
-        logger.warning("No valid data to load.")
-        return
+    logger.info(f"Transformed {len(prepared_data)} games into prepared format.")
+    
+    out_file = os.path.join(os.path.dirname(details_file), 'prepared_data.json')
+    with open(out_file, 'w', encoding='utf-8') as f:
+        json.dump(prepared_data, f, ensure_ascii=False, indent=2)
+        
+    return out_file
 
-    failed_file = os.path.join(os.path.dirname(details_file), 'failed_appids.json')
+def load_to_postgres(prepared_file: str, **context):
+    """
+    Загружает подготовленные данные в PostgreSQL (Bulk Upsert).
+    """
+    
+    with open(prepared_file, 'r', encoding='utf-8') as f:
+        prepared_data = json.load(f)
+    
+    if not prepared_data:
+        logger.info("No data to load.")
+        return
+        
+    failed_file = os.path.join(os.path.dirname(prepared_file), 'failed_appids.json')
     failed_appids = []
     if os.path.exists(failed_file):
         with open(failed_file, 'r') as f:
@@ -302,11 +317,22 @@ def transform_and_load_to_postgres(details_file: str, **context):
         updated_at = CURRENT_TIMESTAMP;
     """
     
+    data_tuples = [
+        (
+            row['appid'], row['name'], row['is_free'], row['price'],
+            row['developers'], row['publishers'], row['genres'],
+            row['release_date'], row['short_description'],
+            row['raw_json'], row['currency']
+        )
+        for row in prepared_data
+    ]
+    
     try:
         cursor = conn.cursor()
-        cursor.executemany(query, prepared_data)
+        cursor.executemany(query, data_tuples)
         conn.commit()
-        logger.info(f"Successfully upserted {len(prepared_data)} records into steam.ods_games.")
+        logger.info(f"Successfully upserted {len(data_tuples)} records into steam.ods_games.")
+        
         if failed_appids:
             try:
                 params_list = [(appid,) for appid in failed_appids]
@@ -382,7 +408,13 @@ with DAG(
     """
 ) as dag:
 
-    # Task 0: ShortCircuit - проверка глобального лимита
+    # Проверка глобального лимита
+    task_count_games = SQLExecuteQueryOperator(
+        task_id='count_existing_games',
+        conn_id=POSTGRES_CONNECTION_ID,
+        sql='SELECT COUNT(*) FROM steam.ods_games;',
+    )
+
     task_check_limit = ShortCircuitOperator(
         task_id='check_global_limit',
         python_callable=check_global_limit,
@@ -394,7 +426,20 @@ with DAG(
         python_callable=extract_master_app_list,
     )
 
-    # Task 2: Anti-Join и выбор батча
+    #Task 2: Anti-Join и выбор батча
+    task_get_existing = SQLExecuteQueryOperator(
+        task_id='get_existing_appids',
+        conn_id=POSTGRES_CONNECTION_ID,
+        sql='SELECT appid FROM steam.ods_games;',
+    )
+
+    # Получение failed appids
+    task_get_failed = SQLExecuteQueryOperator(
+        task_id='get_failed_appids',
+        conn_id=POSTGRES_CONNECTION_ID,
+        sql='SELECT appid FROM steam.failed_appids WHERE retry_count >= 3;',
+    )
+
     task_select_batch = PythonOperator(
         task_id='select_unprocessed_batch',
         python_callable=select_unprocessed_batch,
@@ -412,14 +457,29 @@ with DAG(
         },
     )
 
-    # Task 4: Transform & Load
-    task_load_db = PythonOperator(
-        task_id='transform_and_load_to_postgres',
-        python_callable=transform_and_load_to_postgres,
+    # Task 4: transform
+    task_transform = PythonOperator(
+        task_id='transform_game_details',
+        python_callable=transform_game_details,
         op_kwargs={
             'details_file': "{{ ti.xcom_pull(task_ids='fetch_game_details') }}"
         },
     )
 
+    # Task 5: load
+    task_load_db = PythonOperator(
+        task_id='load_to_postgres',
+        python_callable=load_to_postgres,
+        op_kwargs={
+            'prepared_file': "{{ ti.xcom_pull(task_ids='transform_game_details') }}"
+        },
+    )
+
     # Pipeline Dependencies
-    task_check_limit >> task_extract_list >> task_select_batch >> task_fetch_details >> task_load_db
+    task_count_games >> task_check_limit
+    task_check_limit >> task_extract_list
+    task_check_limit >> task_get_existing
+    task_check_limit >> task_get_failed
+
+    [task_extract_list, task_get_existing, task_get_failed] >> task_select_batch
+    task_select_batch >> task_fetch_details >> task_transform >> task_load_db

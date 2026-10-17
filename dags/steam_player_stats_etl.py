@@ -105,7 +105,7 @@ def select_target_games(**context) -> str:
 
     if not games_data:
         raise AirflowSkipException(
-            "steam.ods_games is empty. Run steam_games_catalog_etl first."
+            "steam.ods_games is empty."
         )
 
     target_games = [{"appid": row[0], "name": row[1]} for row in games_data[:batch_size]]
@@ -183,16 +183,19 @@ def fetch_player_stats(target_file: str, **context) -> str:
     return out_file
 
 
-def transform_and_load_clickhouse(stats_file: str, **context) -> None:
-    """Трансформация сырых данных и пакетная загрузка в ClickHouse с дедупликацией."""
-    credentials = get_clickhouse_credentials()
-    
+def transform_player_stats(stats_file: str, **context) -> str:
+    """
+    Task 3 (Transform): Читает сырые данные и готовит их для ClickHouse.
+    """
     with open(stats_file, 'r', encoding='utf-8') as f:
         raw_stats = json.load(f)
 
     if not raw_stats:
-        logger.info("No player stats data to load.")
-        return
+        logger.info("No player stats data to transform.")
+        out_file = os.path.join(os.path.dirname(stats_file), 'prepared_stats.json')
+        with open(out_file, 'w') as f:
+            json.dump([], f)
+        return out_file
 
     rows = []
     for appid, data in raw_stats.items():
@@ -200,11 +203,28 @@ def transform_and_load_clickhouse(stats_file: str, **context) -> None:
             "appid": int(appid),
             "game_name": data.get('game_name', 'Unknown'),
             "current_players": int(data.get('player_count', 0)),
-            "collected_at": data.get('collected_at'),  # Передаём время сбора из raw данных
+            "collected_at": data.get('collected_at'),
         })
 
+    logger.info(f"Transformed {len(rows)} player stats records.")
+    
+    out_file = os.path.join(os.path.dirname(stats_file), 'prepared_stats.json')
+    with open(out_file, 'w', encoding='utf-8') as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+    
+    return out_file
+
+def load_to_clickhouse(prepared_file: str, **context) -> None:
+    """
+    Task 4 (Load): Загружает подготовленные данные в ClickHouse.
+    """
+    credentials = get_clickhouse_credentials()
+    
+    with open(prepared_file, 'r', encoding='utf-8') as f:
+        rows = json.load(f)
+
     if not rows:
-        logger.warning("No valid rows parsed from player stats data.")
+        logger.info("No data to load into ClickHouse.")
         return
 
     inserted = clickhouse_insert(rows, "player_stats", credentials=credentials)
@@ -270,12 +290,20 @@ with DAG(
         },
     )
 
-    task_load = PythonOperator(
-        task_id='transform_and_load_clickhouse',
-        python_callable=transform_and_load_clickhouse,
+    task_transform = PythonOperator(
+        task_id='transform_player_stats',
+        python_callable=transform_player_stats,
         op_kwargs={
             'stats_file': "{{ ti.xcom_pull(task_ids='fetch_player_stats') }}"
         },
     )
 
-    task_select >> task_fetch >> task_load
+    task_load = PythonOperator(
+        task_id='load_to_clickhouse',
+        python_callable=load_to_clickhouse,
+        op_kwargs={
+            'prepared_file': "{{ ti.xcom_pull(task_ids='transform_player_stats') }}"
+        },
+    )
+
+    task_select >> task_fetch >> task_transform >> task_load
