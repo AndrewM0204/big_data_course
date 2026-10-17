@@ -13,6 +13,7 @@ from airflow.hooks.base import BaseHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk import Param
+from airflow.task.trigger_rule import TriggerRule
 from psycopg2.extras import execute_values
 from pymongo import MongoClient
 from requests.auth import HTTPBasicAuth
@@ -410,6 +411,27 @@ def run_benchmark(engine: str, dataset_file: str, **context) -> str:
     return out_file
 
 
+def cleanup_benchmark_tables(**context) -> None:
+    """
+    Удаляет таблицы/коллекции бенчмарка во всех трех хранилищах.
+    Результаты замеров уже сохранены в JSON/CSV, поэтому данные в БД больше не нужны.
+    Выполняется даже при падении предыдущих тасков (trigger_rule=all_done).
+    """
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    hook.run(f"DROP TABLE IF EXISTS {PG_TABLE};")
+    logger.info(f"Dropped PostgreSQL table {PG_TABLE}.")
+
+    client = get_mongo_client()
+    try:
+        client[MONGO_DB_NAME].drop_collection(MONGO_COLLECTION)
+        logger.info(f"Dropped MongoDB collection {MONGO_DB_NAME}.{MONGO_COLLECTION}.")
+    finally:
+        client.close()
+
+    clickhouse_query(f"DROP TABLE IF EXISTS {CH_TABLE} SYNC", credentials=get_clickhouse_credentials())
+    logger.info(f"Dropped ClickHouse table {CH_TABLE}.")
+
+
 def aggregate_results(postgres_file: str, mongo_file: str, clickhouse_file: str, **context) -> str:
     """Собирает результаты всех прогонов в CSV и считает медианы по (engine, rows)."""
     ds = context['ds']
@@ -518,6 +540,10 @@ with DAG(
 
     **Результаты:** `data/processed/steam_benchmark/<ds>/benchmark_summary.csv` (медианы)
     и `benchmark_runs.csv` (все прогоны).
+
+    **Очистка:** последний таск `cleanup_benchmark_tables` удаляет таблицы/коллекции
+    бенчмарка во всех трех хранилищах (`trigger_rule=all_done`, выполняется и при падении замеров).
+    Сохраняются только файлы с результатами.
     """
 ) as dag:
 
@@ -563,5 +589,12 @@ with DAG(
         },
     )
 
+    # Таблицы бенчмарка удаляем в конце при любом исходе (включая падение замеров)
+    task_cleanup = PythonOperator(
+        task_id='cleanup_benchmark_tables',
+        python_callable=cleanup_benchmark_tables,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
     # Движки идут последовательно: параллельные вставки мешали бы замерам друг друга
-    task_prepare >> task_bench_pg >> task_bench_mongo >> task_bench_ch >> task_aggregate
+    task_prepare >> task_bench_pg >> task_bench_mongo >> task_bench_ch >> task_aggregate >> task_cleanup
