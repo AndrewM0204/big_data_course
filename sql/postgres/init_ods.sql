@@ -6,8 +6,6 @@ CREATE TABLE IF NOT EXISTS steam.ods_games (
     appid             BIGINT PRIMARY KEY,
     name              TEXT,
     is_free           BOOLEAN,
-    price             NUMERIC(10, 2),
-    currency          VARCHAR(3) DEFAULT 'USD',
     developers        TEXT,
     publishers        TEXT,
     genres            TEXT,

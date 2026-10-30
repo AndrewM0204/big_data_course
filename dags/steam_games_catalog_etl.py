@@ -347,7 +347,7 @@ def load_to_postgres(prepared_file: str, **context):
                 
                 conn.commit()
                 logger.info(f"Saved {len(failed_appids)} failed appids to steam.failed_appids")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 conn.rollback()
                 logger.error(f"Failed to save failed_appids: {e}")
     except Exception as e:
