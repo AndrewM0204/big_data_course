@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS steam.ods_games (
 -- Индексы для аналитических запросов
 CREATE INDEX IF NOT EXISTS idx_ods_games_name ON steam.ods_games (name);
 CREATE INDEX IF NOT EXISTS idx_ods_games_is_free ON steam.ods_games (is_free);
-CREATE INDEX IF NOT EXISTS idx_ods_games_price ON steam.ods_games (price);
 CREATE INDEX IF NOT EXISTS idx_ods_games_loaded_at ON steam.ods_games (loaded_at DESC);
 
 -- GIN-индекс для поиска по raw_json (JSONB)
@@ -56,9 +55,6 @@ SELECT
     COUNT(*) AS total_games,
     COUNT(*) FILTER (WHERE is_free = true) AS free_games,
     COUNT(*) FILTER (WHERE is_free = false) AS paid_games,
-    ROUND(AVG(price) FILTER (WHERE is_free = false), 2) AS avg_price,
-    MIN(price) FILTER (WHERE is_free = false) AS min_price,
-    MAX(price) FILTER (WHERE is_free = false) AS max_price,
     MIN(loaded_at) AS first_loaded,
     MAX(loaded_at) AS last_loaded
 FROM steam.ods_games;

@@ -12,7 +12,6 @@ from airflow.exceptions import AirflowSkipException
 from airflow.hooks.base import BaseHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import PythonOperator
-from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 from airflow.sdk import Param
 from pymongo import MongoClient, UpdateOne
 
@@ -40,9 +39,6 @@ POSTGRES_CONN_ID = "steam_postgres"
 MONGO_CONN_ID = "steam_mongo"
 MONGO_DB_NAME = "steam"
 MONGO_COLLECTION = "ods_reviews"
-
-CATALOG_DAG_ID = "steam_games_catalog_etl"
-CATALOG_FINAL_TASK_ID = "transform_and_load_to_postgres"
 
 # Управляющие символы, кроме \t, \n, \r
 CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
@@ -396,29 +392,11 @@ with DAG(
     Собирает пользовательские отзывы для топ-N игр из `steam.ods_games`
     через `IUserReviewsService/GetAppReviews` и загружает в MongoDB `steam.ods_reviews`.
 
-    **Зависимость:** `steam_games_catalog_etl` (то же расписание `@daily`,
-    совпадение по logical date). Сенсор ждёт финальный таск каталога.
-    Состояние `skipped` каталога (сработал `check_global_limit`) считается успешным:
-    каталог уже полон, отзывы для существующих игр собираем.
-
     **Идемпотентность:** upsert по `_id` = `recommendationid`.
 
     **Параметры:** `top_n`, `max_pages_per_game`, `request_delay`.
     """
 ) as dag:
-
-    # Ждём завершения каталога за тот же logical date.
-    # allowed/skipped: skipped от ShortCircuit тоже считается успехом.
-    task_wait_catalog = ExternalTaskSensor(
-        task_id='wait_for_games_catalog',
-        external_dag_id=CATALOG_DAG_ID,
-        external_task_id=CATALOG_FINAL_TASK_ID,
-        allowed_states=['success', 'skipped'],
-        failed_states=['failed', 'upstream_failed'],
-        mode='reschedule',
-        poke_interval=300,
-        timeout=6 * 60 * 60,
-    )
 
     task_select = PythonOperator(
         task_id='select_top_games',
@@ -449,4 +427,4 @@ with DAG(
         },
     )
 
-    task_wait_catalog >> task_select >> task_fetch >> task_transform >> task_load
+    task_select >> task_fetch >> task_transform >> task_load

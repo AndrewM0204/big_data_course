@@ -241,7 +241,11 @@ class MongoBench:
         return self.coll.count_documents({})
 
     def size(self):
-        return int(self.db.command("collStats", MONGO_COLLECTION)["storageSize"])
+        # storageSize обновляется только после фиксации данных на диске.
+        # Без fsync MongoDB может показывать начальный размер файла (4096 байт).
+        self.client.admin.command("fsync")
+        stats = self.db.command("collStats", MONGO_COLLECTION)
+        return int(stats["storageSize"] + stats["totalIndexSize"])
 
     def query(self):
         return list(self.coll.aggregate([
@@ -529,7 +533,8 @@ with DAG(
 
     **Что измеряется для каждого (engine, size, run):**
     - `insert_sec`, `rows_per_sec` — время вставки N записей батчами (без подготовки данных);
-    - `storage_bytes` — размер на диске: `pg_total_relation_size`, `collStats.storageSize`,
+    - `storage_bytes` — размер на диске: `pg_total_relation_size`,
+      `collStats.storageSize + collStats.totalIndexSize` после `fsync`,
       `system.parts.bytes_on_disk` (без принудительного слияния);
     - `query_sec` — агрегация: количество и средняя оценка по appid для положительных отзывов.
 

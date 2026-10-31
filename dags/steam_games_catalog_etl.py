@@ -239,11 +239,6 @@ def transform_game_details(details_file: str, **context) -> str:
     for appid, game in raw_details.items():
         is_free = game.get('is_free', False)
         
-        price_overview = game.get('price_overview') or {}
-        price_cents = price_overview.get('final', 0) if not is_free else 0
-        price = float(price_cents) / 100.0
-        currency = price_overview.get('currency', 'USD') if not is_free else 'USD'
-        
         developers = ", ".join(game.get('developers') or []) or None
         publishers = ", ".join(game.get('publishers') or []) or None
         genres = ", ".join([g.get('description', '') for g in (game.get('genres') or [])]) or None
@@ -258,14 +253,12 @@ def transform_game_details(details_file: str, **context) -> str:
             'appid': int(appid),
             'name': game.get('name'),
             'is_free': is_free,
-            'price': price,
             'developers': developers,
             'publishers': publishers,
             'genres': genres,
             'release_date': release_date,
             'short_description': short_desc,
             'raw_json': raw_json_str,
-            'currency': currency
         })
         
     logger.info(f"Transformed {len(prepared_data)} games into prepared format.")
@@ -300,29 +293,26 @@ def load_to_postgres(prepared_file: str, **context):
     
     query = """
     INSERT INTO steam.ods_games (
-        appid, name, is_free, price, developers, publishers, 
-        genres, release_date, short_description, raw_json, currency
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        appid, name, is_free, developers, publishers,
+        genres, release_date, short_description, raw_json
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (appid) DO UPDATE SET
         name = EXCLUDED.name,
         is_free = EXCLUDED.is_free,
-        price = EXCLUDED.price,
         developers = EXCLUDED.developers,
         publishers = EXCLUDED.publishers,
         genres = EXCLUDED.genres,
         release_date = EXCLUDED.release_date,
         short_description = EXCLUDED.short_description,
         raw_json = EXCLUDED.raw_json,
-        currency = EXCLUDED.currency,
         updated_at = CURRENT_TIMESTAMP;
     """
     
     data_tuples = [
         (
-            row['appid'], row['name'], row['is_free'], row['price'],
+            row['appid'], row['name'], row['is_free'],
             row['developers'], row['publishers'], row['genres'],
-            row['release_date'], row['short_description'],
-            row['raw_json'], row['currency']
+            row['release_date'], row['short_description'], row['raw_json']
         )
         for row in prepared_data
     ]
