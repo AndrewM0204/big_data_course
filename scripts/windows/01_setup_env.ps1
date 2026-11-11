@@ -44,7 +44,8 @@ function Set-EnvValue([string]$key, [string]$value) {
 # 1. FERNET_KEY: encryption key for Airflow connections. Generated inside the official Airflow image.
 if (-not (Get-EnvValue 'FERNET_KEY')) {
     Write-Host 'Generating FERNET_KEY (the first run downloads the Airflow image, this can take a while)...'
-    $fernet = docker run --rm apache/airflow:3.3.2 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # --entrypoint python: bypass the Airflow image entrypoint and call python directly
+    $fernet = docker run --rm --entrypoint python apache/airflow:3.3.2 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     if ($LASTEXITCODE -ne 0 -or -not $fernet) {
         Write-Host 'Failed to generate FERNET_KEY. Is Docker Desktop running?'
         exit 1

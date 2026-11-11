@@ -14,6 +14,6 @@ Write-Host '=== ClickHouse: player statistics rows ==='
 docker compose exec -T clickhouse clickhouse-client --user airflow --password airflow --database steam --query 'SELECT count() AS rows FROM steam.player_stats'
 
 Write-Host '=== MongoDB: reviews in steam.ods_reviews ==='
-docker compose exec -T mongo mongo --quiet -u root -p example --authenticationDatabase admin --eval "db.getSiblingDB('steam').ods_reviews.count()"
+docker compose exec -T mongo mongosh --quiet -u root -p example --authenticationDatabase admin --eval "db.getSiblingDB('steam').ods_reviews.countDocuments({})"
 
 exit 0

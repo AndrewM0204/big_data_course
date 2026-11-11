@@ -6,8 +6,10 @@ Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 $allOk = $true
 
 function Test-Step([string]$label, [scriptblock]$action) {
-    & $action *> $null
-    if ($LASTEXITCODE -eq 0) {
+    # Exit code is taken from the last native command inside the block
+    $null = & $action *>&1
+    $code = $LASTEXITCODE
+    if ($code -eq 0) {
         Write-Host "[OK]   $label"
     } else {
         Write-Host "[FAIL] $label"
@@ -20,7 +22,9 @@ Test-Step 'Postgres reachable (steam_postgres)' {
 }
 
 Test-Step 'ODS schema steam exists' {
-    docker compose exec -T postgres psql -U airflow -d airflow -tAc "SELECT 1 FROM information_schema.schemata WHERE schema_name='steam';" | Select-String -Pattern '^1$' -Quiet
+    # Expect "1"; otherwise force a non-zero exit code so the step is reported as FAIL
+    $out = docker compose exec -T postgres psql -U airflow -d airflow -tAc "SELECT 1 FROM information_schema.schemata WHERE schema_name='steam';"
+    if ("$out".Trim() -ne '1') { cmd /c "exit 1" }
 }
 
 Test-Step 'ClickHouse reachable (clickhouse_http)' {
@@ -28,11 +32,12 @@ Test-Step 'ClickHouse reachable (clickhouse_http)' {
 }
 
 Test-Step 'ClickHouse table steam.player_stats exists' {
-    docker compose exec -T clickhouse clickhouse-client --user airflow --password airflow --database steam --query "EXISTS TABLE steam.player_stats"
+    $out = docker compose exec -T clickhouse clickhouse-client --user airflow --password airflow --database steam --query "EXISTS TABLE steam.player_stats"
+    if ("$out".Trim() -ne '1') { cmd /c "exit 1" }
 }
 
 Test-Step 'Mongo reachable (steam_mongo)' {
-    docker compose exec -T mongo mongo --quiet -u root -p example --authenticationDatabase admin --eval 'db.runCommand({ping:1}).ok'
+    docker compose exec -T mongo mongosh --quiet -u root -p example --authenticationDatabase admin --eval 'db.runCommand({ping:1}).ok'
 }
 
 if ($allOk) {

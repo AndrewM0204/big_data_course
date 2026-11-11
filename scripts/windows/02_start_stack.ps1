@@ -36,5 +36,5 @@ if ($pending.Count -gt 0) {
 }
 
 Write-Host "`nStack is up. Airflow UI: http://localhost:8080  (login: airflow / password: airflow)"
-Write-Host 'Next: 03_register_connections_check.ps1 (optional) or 04_run_catalog.ps1'
+Write-Host 'Next: 03_check_connections.ps1'
 exit 0
