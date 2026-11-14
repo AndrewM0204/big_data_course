@@ -9,11 +9,9 @@ from datetime import datetime, timedelta, timezone
 import requests
 from airflow import DAG
 from airflow.exceptions import AirflowSkipException
-from airflow.hooks.base import BaseHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk import Param
-from pymongo import MongoClient, UpdateOne
 
 # ==========================================
 # КОНФИГУРАЦИЯ
@@ -36,9 +34,6 @@ NUM_PER_PAGE = 100         # Максимум API за одну страницу
 MAX_RETRIES_429 = 3        # Повторы при HTTP 429 с экспоненциальной задержкой
 
 POSTGRES_CONN_ID = "steam_postgres"
-MONGO_CONN_ID = "steam_mongo"
-MONGO_DB_NAME = "steam"
-MONGO_COLLECTION = "ods_reviews"
 
 # Управляющие символы, кроме \t, \n, \r
 CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
@@ -49,20 +44,6 @@ WHITESPACE_RE = re.compile(r'\s+')
 # ==========================================
 # ХЕЛПЕРЫ
 # ==========================================
-def get_mongo_client() -> MongoClient:
-    """Создает клиент MongoDB по Airflow Connection (учетные данные не логируются)."""
-    conn = BaseHook.get_connection(MONGO_CONN_ID)
-    extra = conn.extra_dejson or {}
-    return MongoClient(
-        host=conn.host,
-        port=conn.port or 27017,
-        username=conn.login,
-        password=conn.password,
-        authSource=extra.get('authSource', 'admin'),
-        serverSelectionTimeoutMS=10000,
-    )
-
-
 def _ts_to_iso(ts) -> str | None:
     """Unix timestamp -> ISO-строка UTC. Для пустого значения возвращает None."""
     if not ts:
@@ -232,11 +213,6 @@ def transform_reviews(raw_file: str, **context) -> str:
     ds = context['ds']
     collected_at = context['data_interval_start'].astimezone(timezone.utc).isoformat()
 
-    # Имена игр берем из top_games.json того же запуска
-    top_games_file = os.path.join(os.path.dirname(raw_file), 'top_games.json')
-    with open(top_games_file, 'r', encoding='utf-8') as f:
-        names = {g['appid']: g['name'] for g in json.load(f)}
-
     with open(raw_file, 'r', encoding='utf-8') as f:
         raw_reviews = json.load(f)
 
@@ -254,9 +230,8 @@ def transform_reviews(raw_file: str, **context) -> str:
                     continue
                 author = rv.get('author') or {}
                 doc = {
-                    "_id": str(rec_id),  # uint64 — храним строкой, без потери точности
+                    "review_id": str(rec_id),  # uint64 — храним строкой, без потери точности
                     "appid": appid,
-                    "game_name": names.get(appid),
                     "language": rv.get('language'),
                     "review_text": clean_review_text(rv.get('review', '')),
                     "voted_up": bool(rv.get('voted_up', False)),
@@ -270,13 +245,11 @@ def transform_reviews(raw_file: str, **context) -> str:
                     "refunded": bool(rv.get('refunded', False)),
                     "timestamp_created": _ts_to_iso(rv.get('timestamp_created')),
                     "timestamp_updated": _ts_to_iso(rv.get('timestamp_updated')),
-                    "author": {
-                        "steamid": str(author.get('steamid', '')),
-                        "num_reviews": int(author.get('num_reviews', 0) or 0),
-                        "playtime_forever": int(author.get('playtime_forever', 0) or 0),
-                        "playtime_at_review": int(author.get('playtime_at_review', 0) or 0),
-                        "last_played": _ts_to_iso(author.get('last_played')),
-                    },
+                    "author_steamid": str(author.get('steamid', '')) or None,
+                    "author_num_reviews": int(author.get('num_reviews', 0) or 0),
+                    "author_playtime_forever": int(author.get('playtime_forever', 0) or 0),
+                    "author_playtime_at_review": int(author.get('playtime_at_review', 0) or 0),
+                    "author_last_played": _ts_to_iso(author.get('last_played')),
                     "collected_at": collected_at,
                 }
                 out.write(json.dumps(doc, ensure_ascii=False) + "\n")
@@ -286,61 +259,98 @@ def transform_reviews(raw_file: str, **context) -> str:
     return out_file
 
 
-def load_reviews_mongo(clean_file: str, **context) -> None:
+def load_reviews_postgres(clean_file: str, **context) -> None:
     """
-    Загрузка только новых отзывов в steam.ods_reviews.
-    Отзывы, уже лежащие в коллекции (проверка по _id = recommendationid), пропускаются.
-    Дубликаты внутри одного запуска (одна рецензия пришла с разных страниц) тоже отбрасываются.
+    Загрузка отзывов в PostgreSQL (steam.ods_reviews).
+    Дубликаты внутри одного запуска отбрасываются, повторная загрузка обновляет
+    существующую запись по review_id.
     """
     docs = {}
     with open(clean_file, 'r', encoding='utf-8') as f:
         for line in f:
             doc = json.loads(line)
-            # Даты переводим в datetime для типа BSON Date
-            for key in ('timestamp_created', 'timestamp_updated', 'collected_at'):
+            for key in (
+                'timestamp_created',
+                'timestamp_updated',
+                'author_last_played',
+                'collected_at',
+            ):
                 if doc.get(key):
                     doc[key] = datetime.fromisoformat(doc[key])
-            author = doc.get('author') or {}
-            if author.get('last_played'):
-                author['last_played'] = datetime.fromisoformat(author['last_played'])
-            # setdefault: оставляем первое вхождение рецензии
-            docs.setdefault(doc['_id'], doc)
+            if not doc.get('collected_at'):
+                doc['collected_at'] = datetime.now(timezone.utc)
+            docs.setdefault(doc['review_id'], doc)
 
     if not docs:
-        logger.info("No reviews to load into MongoDB.")
+        logger.info("No reviews to load into PostgreSQL.")
         return
 
-    client = get_mongo_client()
-    try:
-        collection = client[MONGO_DB_NAME][MONGO_COLLECTION]
-        collection.create_index([('appid', 1)], name='idx_appid')
-        collection.create_index([('timestamp_created', -1)], name='idx_timestamp_created')
+    query = """
+    INSERT INTO steam.ods_reviews (
+        review_id, appid, game_name, language, review_text, voted_up,
+        votes_up, votes_funny, weighted_vote_score, comment_count,
+        steam_purchase, received_for_free, written_during_early_access, refunded,
+        timestamp_created, timestamp_updated,
+        author_steamid, author_num_reviews, author_playtime_forever,
+        author_playtime_at_review, author_last_played, collected_at
+    ) VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    )
+    ON CONFLICT (review_id) DO UPDATE SET
+        appid = EXCLUDED.appid,
+        game_name = EXCLUDED.game_name,
+        language = EXCLUDED.language,
+        review_text = EXCLUDED.review_text,
+        voted_up = EXCLUDED.voted_up,
+        votes_up = EXCLUDED.votes_up,
+        votes_funny = EXCLUDED.votes_funny,
+        weighted_vote_score = EXCLUDED.weighted_vote_score,
+        comment_count = EXCLUDED.comment_count,
+        steam_purchase = EXCLUDED.steam_purchase,
+        received_for_free = EXCLUDED.received_for_free,
+        written_during_early_access = EXCLUDED.written_during_early_access,
+        refunded = EXCLUDED.refunded,
+        timestamp_created = EXCLUDED.timestamp_created,
+        timestamp_updated = EXCLUDED.timestamp_updated,
+        author_steamid = EXCLUDED.author_steamid,
+        author_num_reviews = EXCLUDED.author_num_reviews,
+        author_playtime_forever = EXCLUDED.author_playtime_forever,
+        author_playtime_at_review = EXCLUDED.author_playtime_at_review,
+        author_last_played = EXCLUDED.author_last_played,
+        collected_at = EXCLUDED.collected_at;
+    """
 
-        # Ищем уже загруженные _id батчами, чтобы не тянуть всю коллекцию в память
-        all_ids = list(docs.keys())
-        lookup_batch = 1000
-        existing = set()
-        for start in range(0, len(all_ids), lookup_batch):
-            chunk = all_ids[start:start + lookup_batch]
-            existing.update(
-                d['_id'] for d in collection.find({'_id': {'$in': chunk}}, {'_id': 1})
-            )
-
-        new_docs = [doc for doc_id, doc in docs.items() if doc_id not in existing]
-        logger.info(
-            f"Reviews: {len(docs)} unique in file, {len(existing)} already in MongoDB, "
-            f"{len(new_docs)} new."
+    rows = [
+        (
+            doc['review_id'], doc['appid'], doc.get('game_name'), doc.get('language'),
+            doc.get('review_text'), doc.get('voted_up'), doc.get('votes_up'),
+            doc.get('votes_funny'), doc.get('weighted_vote_score'), doc.get('comment_count'),
+            doc.get('steam_purchase'), doc.get('received_for_free'),
+            doc.get('written_during_early_access'), doc.get('refunded'),
+            doc.get('timestamp_created'), doc.get('timestamp_updated'),
+            doc.get('author_steamid'), doc.get('author_num_reviews'),
+            doc.get('author_playtime_forever'), doc.get('author_playtime_at_review'),
+            doc.get('author_last_played'), doc['collected_at'],
         )
-        if not new_docs:
-            logger.info("All reviews are already loaded; nothing to insert.")
-            return
+        for doc in docs.values()
+    ]
 
-        insert_batch = 1000
-        for start in range(0, len(new_docs), insert_batch):
-            collection.insert_many(new_docs[start:start + insert_batch], ordered=False)
-        logger.info(f"Inserted {len(new_docs)} new reviews into {MONGO_DB_NAME}.{MONGO_COLLECTION}.")
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        for start in range(0, len(rows), 1000):
+            cursor.executemany(query, rows[start:start + 1000])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        client.close()
+        cursor.close()
+        conn.close()
+
+    logger.info(f"Loaded {len(rows)} reviews into steam.ods_reviews.")
 
 
 # ==========================================
@@ -357,12 +367,12 @@ default_args = {
 with DAG(
     dag_id='steam_reviews_collector',
     default_args=default_args,
-    description='Collect Steam user reviews for top games into MongoDB (ODS Layer)',
+    description='Collect Steam user reviews for top games into PostgreSQL (ODS Layer)',
     schedule='@daily',
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=['steam', 'ods', 'reviews', 'mongo'],
+    tags=['steam', 'ods', 'reviews', 'postgres'],
     params={
         'top_n': Param(
             100,
@@ -390,9 +400,9 @@ with DAG(
     ### Steam Reviews Collector
 
     Собирает пользовательские отзывы для топ-N игр из `steam.ods_games`
-    через `IUserReviewsService/GetAppReviews` и загружает в MongoDB `steam.ods_reviews`.
+    через `IUserReviewsService/GetAppReviews` и загружает в PostgreSQL `steam.ods_reviews`.
 
-    **Идемпотентность:** upsert по `_id` = `recommendationid`.
+    **Идемпотентность:** upsert по `review_id` = `recommendationid`.
 
     **Параметры:** `top_n`, `max_pages_per_game`, `request_delay`.
     """
@@ -420,8 +430,8 @@ with DAG(
     )
 
     task_load = PythonOperator(
-        task_id='load_reviews_mongo',
-        python_callable=load_reviews_mongo,
+        task_id='load_reviews_postgres',
+        python_callable=load_reviews_postgres,
         op_kwargs={
             'clean_file': "{{ ti.xcom_pull(task_ids='transform_reviews') }}"
         },
