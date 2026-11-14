@@ -67,11 +67,10 @@ def select_target_games(**context) -> str:
 def fetch_player_stats(target_file: str, **context) -> str:
     """
     Для каждой целевой игры запрашивает текущий онлайн через Steam API.
-    Передаёт collected_at из Airflow context для точного времени сбора.
+    Передаёт фактическое UTC-время сбора.
     """
     ds = context['ds']
-    # Используем data_interval_start как точное время начала интервала сбора
-    collected_at = context['data_interval_start'].astimezone(timezone.utc).isoformat()
+    collected_at = datetime.now(timezone.utc).isoformat()
     
     request_delay = float(context['params'].get('request_delay', 0.5))
 

@@ -208,10 +208,9 @@ def fetch_reviews(top_games_file: str, **context) -> str:
 def transform_reviews(raw_file: str, **context) -> str:
     """
     Очищает текст, переводит Unix timestamp в datetime UTC,
-    добавляет appid, game_name и collected_at. Пишет JSONL.
+    добавляет appid и game_name. Пишет JSONL.
     """
     ds = context['ds']
-    collected_at = context['data_interval_start'].astimezone(timezone.utc).isoformat()
 
     with open(raw_file, 'r', encoding='utf-8') as f:
         raw_reviews = json.load(f)
@@ -250,7 +249,6 @@ def transform_reviews(raw_file: str, **context) -> str:
                     "author_playtime_forever": int(author.get('playtime_forever', 0) or 0),
                     "author_playtime_at_review": int(author.get('playtime_at_review', 0) or 0),
                     "author_last_played": _ts_to_iso(author.get('last_played')),
-                    "collected_at": collected_at,
                 }
                 out.write(json.dumps(doc, ensure_ascii=False) + "\n")
                 count += 1
@@ -269,16 +267,9 @@ def load_reviews_postgres(clean_file: str, **context) -> None:
     with open(clean_file, 'r', encoding='utf-8') as f:
         for line in f:
             doc = json.loads(line)
-            for key in (
-                'timestamp_created',
-                'timestamp_updated',
-                'author_last_played',
-                'collected_at',
-            ):
+            for key in ('timestamp_created', 'timestamp_updated', 'author_last_played'):
                 if doc.get(key):
                     doc[key] = datetime.fromisoformat(doc[key])
-            if not doc.get('collected_at'):
-                doc['collected_at'] = datetime.now(timezone.utc)
             docs.setdefault(doc['review_id'], doc)
 
     if not docs:
@@ -292,10 +283,10 @@ def load_reviews_postgres(clean_file: str, **context) -> None:
         steam_purchase, received_for_free, written_during_early_access, refunded,
         timestamp_created, timestamp_updated,
         author_steamid, author_num_reviews, author_playtime_forever,
-        author_playtime_at_review, author_last_played, collected_at
+        author_playtime_at_review, author_last_played
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     )
     ON CONFLICT (review_id) DO UPDATE SET
         appid = EXCLUDED.appid,
@@ -317,8 +308,7 @@ def load_reviews_postgres(clean_file: str, **context) -> None:
         author_num_reviews = EXCLUDED.author_num_reviews,
         author_playtime_forever = EXCLUDED.author_playtime_forever,
         author_playtime_at_review = EXCLUDED.author_playtime_at_review,
-        author_last_played = EXCLUDED.author_last_played,
-        collected_at = EXCLUDED.collected_at;
+        author_last_played = EXCLUDED.author_last_played;
     """
 
     rows = [
@@ -331,7 +321,7 @@ def load_reviews_postgres(clean_file: str, **context) -> None:
             doc.get('timestamp_created'), doc.get('timestamp_updated'),
             doc.get('author_steamid'), doc.get('author_num_reviews'),
             doc.get('author_playtime_forever'), doc.get('author_playtime_at_review'),
-            doc.get('author_last_played'), doc['collected_at'],
+            doc.get('author_last_played'),
         )
         for doc in docs.values()
     ]
