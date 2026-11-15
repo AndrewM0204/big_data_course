@@ -142,7 +142,6 @@ def transform_player_stats(stats_file: str, **context) -> str:
     for appid, data in raw_stats.items():
         rows.append({
             "appid": int(appid),
-            "game_name": data.get('game_name', 'Unknown'),
             "current_players": int(data.get('player_count', 0)),
             "collected_at": data.get('collected_at'),
         })
@@ -177,17 +176,15 @@ def load_to_postgres(prepared_file: str, **context) -> None:
             collected_at = collected_at.replace(tzinfo=timezone.utc)
         values.append((
             int(row['appid']),
-            row.get('game_name'),
             int(row['current_players']),
             collected_at,
         ))
 
     query = """
     INSERT INTO steam.ods_player_stats (
-        appid, game_name, current_players, collected_at
-    ) VALUES (%s, %s, %s, %s)
+        appid, current_players, collected_at
+    ) VALUES (%s, %s, %s)
     ON CONFLICT (appid, collected_at) DO UPDATE SET
-        game_name = EXCLUDED.game_name,
         current_players = EXCLUDED.current_players;
     """
 
