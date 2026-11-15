@@ -78,7 +78,6 @@ x-airflow-common:
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     AIRFLOW_CONN_STEAM_POSTGRES: postgresql://airflow:airflow@postgres:5432/airflow
     AIRFLOW_CONN_CLICKHOUSE_HTTP: http://airflow:airflow@clickhouse:8123/?database=steam
-    AIRFLOW_CONN_STEAM_MONGO: mongodb://root:example@mongo:27017/?authSource=admin
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
@@ -339,16 +338,6 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
-  mongo:
-    image: mongo:6.0
-    restart: always
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: example
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo_data:/data/db
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     restart: always
@@ -376,5 +365,4 @@ services:
 
 volumes:
   postgres-db-volume:
-  mongo_data:
   clickhouse_data:

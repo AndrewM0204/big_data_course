@@ -2,16 +2,14 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from airflow import DAG
 from airflow.exceptions import AirflowSkipException
-from airflow.hooks.base import BaseHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk import Param
-from requests.auth import HTTPBasicAuth
 
 # ==========================================
 # КОНФИГУРАЦИЯ
@@ -26,61 +24,6 @@ PLAYER_STATS_URL = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurr
 
 # Airflow Connections
 POSTGRES_CONN_ID = "steam_postgres"
-CLICKHOUSE_CONN_ID = "clickhouse_http"
-
-
-# ==========================================
-# ХЕЛПЕРЫ
-# ==========================================
-def get_clickhouse_credentials() -> dict:
-    """Получает credentials для ClickHouse из Airflow Connection."""
-    conn = BaseHook.get_connection(CLICKHOUSE_CONN_ID)
-    extra = conn.extra_dejson or {}
-    return {
-        "host": f"http://{conn.host}:{conn.port or 8123}",
-        "user": conn.login,
-        "password": conn.password,
-        "database": extra.get("database", "steam"),
-    }
-
-
-def clickhouse_query(
-    query: str,
-    data: bytes | None = None,
-    credentials: dict | None = None,
-) -> str:
-    """Выполняет запрос к ClickHouse через HTTP-интерфейс."""
-    if credentials is None:
-        credentials = get_clickhouse_credentials()
-    
-    params = {
-        "query": query,
-        "database": credentials["database"],
-        "date_time_input_format": "best_effort",
-    }
-    
-    resp = requests.post(
-        credentials["host"],
-        params=params,
-        data=data,
-        auth=HTTPBasicAuth(credentials["user"], credentials["password"]),
-        timeout=60,
-    )
-    response_text = resp.text.strip()
-    
-    if not resp.ok or response_text.startswith("Code:") or "DB::Exception" in response_text:
-        raise RuntimeError(f"ClickHouse error (HTTP {resp.status_code}): {response_text}")
-        
-    return response_text
-
-
-def clickhouse_insert(rows: list, table: str, credentials: dict | None = None) -> int:
-    """Пакетная вставка строк в ClickHouse в формате JSONEachRow."""
-    if not rows:
-        return 0
-    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
-    clickhouse_query(f"INSERT INTO {table} FORMAT JSONEachRow", data=body.encode("utf-8"), credentials=credentials)
-    return len(rows)
 
 
 # ==========================================
@@ -124,11 +67,10 @@ def select_target_games(**context) -> str:
 def fetch_player_stats(target_file: str, **context) -> str:
     """
     Для каждой целевой игры запрашивает текущий онлайн через Steam API.
-    Передаёт collected_at из Airflow context для точного времени сбора.
+    Передаёт фактическое UTC-время сбора.
     """
     ds = context['ds']
-    # Используем data_interval_start как точное время начала интервала сбора
-    collected_at = context['data_interval_start'].strftime("%Y-%m-%d %H:%M:%S")
+    collected_at = datetime.now(timezone.utc).isoformat()
     
     request_delay = float(context['params'].get('request_delay', 0.5))
 
@@ -158,8 +100,7 @@ def fetch_player_stats(target_file: str, **context) -> str:
             if response_data.get('result') == 1:
                 raw_stats[appid] = {
                     "player_count": response_data.get('player_count', 0),
-                    "game_name": game['name'],
-                    "collected_at": collected_at,  # Передаём время сбора
+                    "collected_at": collected_at,
                 }
             else:
                 logger.warning(f"No player stats for appid {appid} (result != 1).")
@@ -185,7 +126,7 @@ def fetch_player_stats(target_file: str, **context) -> str:
 
 def transform_player_stats(stats_file: str, **context) -> str:
     """
-    Task 3 (Transform): Читает сырые данные и готовит их для ClickHouse.
+    Task 3 (Transform): Читает сырые данные и готовит их для PostgreSQL.
     """
     with open(stats_file, 'r', encoding='utf-8') as f:
         raw_stats = json.load(f)
@@ -214,21 +155,57 @@ def transform_player_stats(stats_file: str, **context) -> str:
     
     return out_file
 
-def load_to_clickhouse(prepared_file: str, **context) -> None:
+def load_to_postgres(prepared_file: str, **context) -> None:
     """
-    Task 4 (Load): Загружает подготовленные данные в ClickHouse.
+    Task 4 (Load): Загружает подготовленные данные в PostgreSQL.
     """
-    credentials = get_clickhouse_credentials()
-    
     with open(prepared_file, 'r', encoding='utf-8') as f:
         rows = json.load(f)
 
     if not rows:
-        logger.info("No data to load into ClickHouse.")
+        logger.info("No data to load into PostgreSQL.")
         return
 
-    inserted = clickhouse_insert(rows, "player_stats", credentials=credentials)
-    logger.info(f"Inserted {inserted} rows into steam.player_stats.")
+    values = []
+    for row in rows:
+        collected_at = row.get('collected_at')
+        if isinstance(collected_at, str):
+            collected_at = datetime.fromisoformat(collected_at)
+        if collected_at is None:
+            collected_at = datetime.now(timezone.utc)
+        elif collected_at.tzinfo is None:
+            collected_at = collected_at.replace(tzinfo=timezone.utc)
+        values.append((
+            int(row['appid']),
+            row.get('game_name'),
+            int(row['current_players']),
+            collected_at,
+        ))
+
+    query = """
+    INSERT INTO steam.ods_player_stats (
+        appid, game_name, current_players, collected_at
+    ) VALUES (%s, %s, %s, %s)
+    ON CONFLICT (appid, collected_at) DO UPDATE SET
+        game_name = EXCLUDED.game_name,
+        current_players = EXCLUDED.current_players;
+    """
+
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        for start in range(0, len(values), 1000):
+            cursor.executemany(query, values[start:start + 1000])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    logger.info(f"Loaded {len(values)} rows into steam.ods_player_stats.")
 
 
 # ==========================================
@@ -245,12 +222,12 @@ default_args = {
 with DAG(
     dag_id='steam_player_stats_etl',
     default_args=default_args,
-    description='Collect Steam player statistics and load into ClickHouse',
+    description='Collect Steam player statistics and load into PostgreSQL',
     schedule='0 */3 * * *',  # Каждые 3 часа
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=['steam', 'player_stats', 'clickhouse', 'time_series'],
+    tags=['steam', 'player_stats', 'postgres', 'time_series'],
     params={
         'batch_size': Param(
             200,
@@ -270,8 +247,8 @@ with DAG(
     doc_md="""
 ### Steam Player Stats ETL
 
-Собирает текущую статистику онлайна игроков для игр из каталога (`steam.ods_games`) 
-и загружает в ClickHouse для анализа временных рядов.
+Собирает текущую статистику онлайна игроков для игр из каталога (`steam.ods_games`)
+и загружает в PostgreSQL `steam.ods_player_stats` для анализа временных рядов.
 
 **Расписание:** каждые 3 часа (`0 */3 * * *`).
 """
@@ -299,8 +276,8 @@ with DAG(
     )
 
     task_load = PythonOperator(
-        task_id='load_to_clickhouse',
-        python_callable=load_to_clickhouse,
+        task_id='load_to_postgres',
+        python_callable=load_to_postgres,
         op_kwargs={
             'prepared_file': "{{ ti.xcom_pull(task_ids='transform_player_stats') }}"
         },
