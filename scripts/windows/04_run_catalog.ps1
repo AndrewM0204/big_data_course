@@ -12,7 +12,8 @@ Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 Write-Host "Running steam_games_catalog_etl for $Date (batch=$BatchSize, max=$MaxGames)..."
 Write-Host 'This takes a while: the DAG waits about 1.2 s per game because of Steam rate limits.'
 
-$conf = "{`"batch_size`": $BatchSize, `"max_games_total`": $MaxGames}"
+$conf = "{\`"batch_size\`": $BatchSize, \`"max_games_total\`": $MaxGames}"
+
 docker compose run --rm airflow-cli airflow dags test steam_games_catalog_etl $Date --conf $conf
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nThe run failed. Typical causes:"
