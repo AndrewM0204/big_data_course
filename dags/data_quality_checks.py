@@ -509,7 +509,7 @@ with DAG(
     write_dq_summary = PythonOperator(
         task_id='write_dq_summary',
         python_callable=write_dq_summary,
-        trigger_rule='ALL_DONE',
+        trigger_rule='all_done',
     )
 
     checks = [

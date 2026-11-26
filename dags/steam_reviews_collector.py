@@ -208,7 +208,7 @@ def fetch_reviews(top_games_file: str, **context) -> str:
 def transform_reviews(raw_file: str, **context) -> str:
     """
     Очищает текст, переводит Unix timestamp в datetime UTC,
-    добавляет appid и game_name. Пишет JSONL.
+    добавляет appid. Пишет JSONL.
     """
     ds = context['ds']
 
@@ -278,19 +278,18 @@ def load_reviews_postgres(clean_file: str, **context) -> None:
 
     query = """
     INSERT INTO steam.ods_reviews (
-        review_id, appid, game_name, language, review_text, voted_up,
+        review_id, appid, language, review_text, voted_up,
         votes_up, votes_funny, weighted_vote_score, comment_count,
         steam_purchase, received_for_free, written_during_early_access, refunded,
         timestamp_created, timestamp_updated,
         author_steamid, author_num_reviews, author_playtime_forever,
         author_playtime_at_review, author_last_played
     ) VALUES (
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     )
     ON CONFLICT (review_id) DO UPDATE SET
         appid = EXCLUDED.appid,
-        game_name = EXCLUDED.game_name,
         language = EXCLUDED.language,
         review_text = EXCLUDED.review_text,
         voted_up = EXCLUDED.voted_up,
@@ -313,7 +312,7 @@ def load_reviews_postgres(clean_file: str, **context) -> None:
 
     rows = [
         (
-            doc['review_id'], doc['appid'], doc.get('game_name'), doc.get('language'),
+            doc['review_id'], doc['appid'], doc.get('language'),
             doc.get('review_text'), doc.get('voted_up'), doc.get('votes_up'),
             doc.get('votes_funny'), doc.get('weighted_vote_score'), doc.get('comment_count'),
             doc.get('steam_purchase'), doc.get('received_for_free'),
