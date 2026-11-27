@@ -92,6 +92,43 @@ x-airflow-common:
     postgres:
       condition: service_healthy
 
+x-openmetadata-env: &openmetadata-env
+  OPENMETADATA_CLUSTER_NAME: ${OPENMETADATA_CLUSTER_NAME:-openmetadata}
+  SERVER_PORT: "8585"
+  SERVER_ADMIN_PORT: "8586"
+  LOG_LEVEL: INFO
+  AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
+  AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
+  AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+  AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: '["all"]'
+  AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
+  AUTHORIZER_PRINCIPAL_DOMAIN: open-metadata.org
+  AUTHORIZER_ALLOWED_DOMAINS: "[]"
+  AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "false"
+  AUTHORIZER_ENABLE_SECURE_SOCKET: "false"
+  AUTHENTICATION_PROVIDER: basic
+  AUTHENTICATION_ENABLE_SELF_SIGNUP: "true"
+  DB_DRIVER_CLASS: org.postgresql.Driver
+  DB_SCHEME: postgresql
+  DB_PARAMS: allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+  DB_USE_SSL: "false"
+  DB_USER: openmetadata_user
+  DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD:-openmetadata_password}
+  DB_HOST: openmetadata-db
+  DB_PORT: "5432"
+  OM_DATABASE: openmetadata_db
+  ELASTICSEARCH_HOST: opensearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+  ELASTICSEARCH_USER: ""
+  ELASTICSEARCH_PASSWORD: ""
+  SEARCH_TYPE: opensearch
+  ELASTICSEARCH_CLUSTER_ALIAS: openmetadata
+  PIPELINE_SERVICE_CLIENT_SECRETS_MANAGER_LOADER: noop
+  PIPELINE_SERVICE_CLIENT_VERIFY_SSL: no-ssl
+  OPENMETADATA_HEAP_OPTS: -Xmx2g -Xms1g
+  MASK_PASSWORDS_API: "true"
+
 services:
   postgres:
     image: postgres:16
@@ -104,6 +141,7 @@ services:
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
       - ./sql/postgres:/docker-entrypoint-initdb.d
+      - ./sql/marts:/marts:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
@@ -354,6 +392,7 @@ services:
       SUPERSET_READER_PASSWORD: ${SUPERSET_READER_PASSWORD:-superset_reader}
     volumes:
       - ./sql/postgres:/scripts:ro
+      - ./sql/marts:/marts:ro
     entrypoint: ["/bin/bash", "/scripts/zz_init_lab3_superset.sh"]
     restart: "no"
 
@@ -390,6 +429,81 @@ services:
       start_period: 90s
     restart: always
 
+  openmetadata-db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: openmetadata_user
+      POSTGRES_PASSWORD: ${OPENMETADATA_DB_PASSWORD:-openmetadata_password}
+      POSTGRES_DB: openmetadata_db
+    volumes:
+      - openmetadata_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openmetadata_user -d openmetadata_db"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    restart: always
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      plugins.security.disabled: "true"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-OpenMetadata_password123!!!}
+      indices.query.bool.max_clause_count: "4096"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(green|yellow)\"' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  openmetadata-migrate:
+    image: openmetadata/server:1.8.0
+    working_dir: /opt/openmetadata
+    command: ["./bootstrap/openmetadata-ops.sh", "-d", "migrate", "--force"]
+    environment: *openmetadata-env
+    depends_on:
+      openmetadata-db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: "no"
+
+  openmetadata-server:
+    image: openmetadata/server:1.8.0
+    restart: always
+    environment:
+      <<: *openmetadata-env
+      SERVER_HOST_API_URL: http://openmetadata-server:8585/api
+    ports:
+      - "8585:8585"
+    depends_on:
+      openmetadata-db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8586/healthcheck || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     restart: always
@@ -419,3 +533,5 @@ volumes:
   postgres-db-volume:
   clickhouse_data:
   superset_home:
+  openmetadata_db_data:
+  opensearch_data:

@@ -42,4 +42,8 @@ fi
 
 "${PSQL[@]}" -c "GRANT CONNECT ON DATABASE superset TO superset;"
 
-echo "Lab3 Superset database and read-only role are ready."
+if [ -f /marts/init_marts.sql ]; then
+    "${PSQL[@]}" -f /marts/init_marts.sql
+fi
+
+echo "Lab3 Superset database, read-only role and marts schema are ready."
