@@ -1,0 +1,6 @@
+import os
+
+SQLALCHEMY_DATABASE_URI = os.environ["SUPERSET_SQLALCHEMY_DATABASE_URI"]
+SECRET_KEY = os.environ.get("SUPERSET_SECRET_KEY", "change_me_superset_secret")
+LOAD_EXAMPLES = False
+SQLALCHEMY_TRACK_MODIFICATIONS = False

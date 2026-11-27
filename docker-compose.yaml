@@ -99,6 +99,8 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:-superset}
+      SUPERSET_READER_PASSWORD: ${SUPERSET_READER_PASSWORD:-superset_reader}
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
       - ./sql/postgres:/docker-entrypoint-initdb.d
@@ -338,6 +340,56 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+  lab3-db-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+      PGPASSWORD: airflow
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:-superset}
+      SUPERSET_READER_PASSWORD: ${SUPERSET_READER_PASSWORD:-superset_reader}
+    volumes:
+      - ./sql/postgres:/scripts:ro
+    entrypoint: ["/bin/bash", "/scripts/zz_init_lab3_superset.sh"]
+    restart: "no"
+
+  superset:
+    build:
+      context: ./docker/superset
+      args:
+        SUPERSET_IMAGE: ${SUPERSET_IMAGE:-apache/superset:4.1.2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lab3-db-init:
+        condition: service_completed_successfully
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change_me_superset_secret}
+      SUPERSET_SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://superset:${SUPERSET_DB_PASSWORD:-superset}@postgres:5432/superset
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_ENV: production
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
+      SUPERSET_ADMIN_FIRSTNAME: ${SUPERSET_ADMIN_FIRSTNAME:-Superset}
+      SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME:-Admin}
+      SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL:-admin@example.com}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset_home:/app/superset_home
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8088/health', timeout=5).read()\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: always
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     restart: always
@@ -366,3 +418,4 @@ services:
 volumes:
   postgres-db-volume:
   clickhouse_data:
+  superset_home:
