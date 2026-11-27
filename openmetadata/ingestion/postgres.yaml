@@ -1,0 +1,35 @@
+source:
+  type: postgres
+  serviceName: steam-postgres
+  serviceConnection:
+    config:
+      type: Postgres
+      username: airflow
+      authType:
+        password: airflow
+      hostPort: postgres:5432
+      database: airflow
+      ingestAllDatabases: false
+      sslMode: disable
+  sourceConfig:
+    config:
+      type: DatabaseMetadata
+      markDeletedTables: false
+      includeTables: true
+      includeViews: true
+      schemaFilterPattern:
+        includes:
+          - steam
+          - dds
+          - marts
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  openMetadataServerConfig:
+    hostPort: http://openmetadata-server:8585/api
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: __OM_JWT_TOKEN__

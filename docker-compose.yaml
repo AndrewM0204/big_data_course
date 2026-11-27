@@ -504,6 +504,40 @@ services:
       retries: 20
       start_period: 90s
 
+  openmetadata-ingestion:
+    image: openmetadata/ingestion:1.8.0
+    profiles:
+      - ingestion
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openmetadata-server:
+        condition: service_healthy
+    environment:
+      OM_SERVER_URL: http://openmetadata-server:8585/api
+      OM_ADMIN_EMAIL: ${OPENMETADATA_ADMIN_EMAIL:-admin@open-metadata.org}
+      OM_ADMIN_PASSWORD: ${OPENMETADATA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./openmetadata/ingestion:/ingestion:ro
+    entrypoint: ["/bin/bash", "/ingestion/ingest-postgres.sh"]
+    restart: "no"
+
+  openmetadata-lineage:
+    image: openmetadata/ingestion:1.8.0
+    profiles:
+      - lineage
+    depends_on:
+      openmetadata-server:
+        condition: service_healthy
+    environment:
+      OM_SERVER_URL: http://openmetadata-server:8585/api
+      OM_ADMIN_EMAIL: ${OPENMETADATA_ADMIN_EMAIL:-admin@open-metadata.org}
+      OM_ADMIN_PASSWORD: ${OPENMETADATA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./openmetadata/ingestion:/ingestion:ro
+    entrypoint: ["python", "/ingestion/lineage.py"]
+    restart: "no"
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     restart: always
