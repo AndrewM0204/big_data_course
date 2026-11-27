@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from datetime import date, datetime, timedelta
 
@@ -24,12 +26,10 @@ RELEASE_DATE_FORMATS = (
 
 
 def daily_slot(dt: datetime) -> datetime:
-    """Выравнивает logical date на полночь — сетку @daily DAG'ов."""
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def parse_release_date(value: str | None) -> date | None:
-    """Парсит типовые форматы даты Steam, иначе возвращает None."""
     if not value:
         return None
     text = value.strip()
@@ -42,14 +42,41 @@ def parse_release_date(value: str | None) -> date | None:
 
 
 def split_csv(value: str | None) -> list[str]:
-    """Разбивает строку ODS на уникальные значения через запятую."""
     if not value:
         return []
     return sorted({part.strip() for part in value.split(",") if part.strip()})
 
 
+def source_hash(*parts) -> str:
+    payload = json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
 def get_connection():
     return PostgresHook(postgres_conn_id=POSTGRES_CONN_ID).get_conn()
+
+
+def ensure_lookup(cursor, table: str, id_column: str, name_column: str, names: set[str]) -> dict[str, int]:
+    if not names:
+        return {}
+    cursor.executemany(
+        f"INSERT INTO {table} ({name_column}) VALUES (%s) ON CONFLICT ({name_column}) DO NOTHING;",
+        [(name,) for name in sorted(names)],
+    )
+    cursor.execute(
+        f"SELECT {id_column}, {name_column} FROM {table} WHERE {name_column} = ANY(%s);",
+        (list(names),),
+    )
+    return {name: dimension_id for dimension_id, name in cursor.fetchall()}
+
+
+def sync_bridges(cursor, table: str, fk_column: str, game_sk: int, dimension_ids: set[int]) -> None:
+    cursor.execute(f"DELETE FROM {table} WHERE game_sk = %s;", (game_sk,))
+    if dimension_ids:
+        cursor.executemany(
+            f"INSERT INTO {table} (game_sk, {fk_column}) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+            [(game_sk, dimension_id) for dimension_id in sorted(dimension_ids)],
+        )
 
 
 def check_ods_games(**context) -> None:
@@ -68,116 +95,152 @@ def check_ods_games(**context) -> None:
     logger.info(f"steam.ods_games contains {count} rows.")
 
 
-def load_dim_game(**context) -> None:
+def sync_game_dimensions(**context) -> None:
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """
-            SELECT appid, name, is_free, release_date, short_description
+            SELECT appid, name, is_free, release_date, short_description,
+                   genres, developers, publishers
             FROM steam.ods_games;
             """
         )
-        rows = cursor.fetchall()
-        if not rows:
+        raw_rows = cursor.fetchall()
+        if not raw_rows:
             raise AirflowSkipException("steam.ods_games is empty.")
 
-        values = [
-            (
+        source = {}
+        for appid, name, is_free, release_raw, description, genres_raw, developers_raw, publishers_raw in raw_rows:
+            genres = split_csv(genres_raw)
+            developers = split_csv(developers_raw)
+            publishers = split_csv(publishers_raw)
+            release_date = parse_release_date(release_raw)
+            payload = (
                 int(appid),
                 name or "Unknown",
                 bool(is_free),
-                parse_release_date(release_date),
-                short_description,
+                release_date.isoformat() if release_date else None,
+                description,
+                genres,
+                developers,
+                publishers,
             )
-            for appid, name, is_free, release_date, short_description in rows
-        ]
+            source[int(appid)] = {
+                "name": name or "Unknown",
+                "is_free": bool(is_free),
+                "release_date": release_date,
+                "short_description": description,
+                "genres": genres,
+                "developers": developers,
+                "publishers": publishers,
+                "row_hash": source_hash(*payload),
+            }
 
-        cursor.executemany(
-            """
-            INSERT INTO dds.dim_game (
-                appid, name, is_free, release_date, short_description
-            ) VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (appid) DO UPDATE SET
-                name = EXCLUDED.name,
-                is_free = EXCLUDED.is_free,
-                release_date = EXCLUDED.release_date,
-                short_description = EXCLUDED.short_description;
-            """,
-            values,
+        genre_map = ensure_lookup(
+            cursor, "dds.dim_genre", "genre_id", "genre_name",
+            {value for row in source.values() for value in row["genres"]},
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
-        conn.close()
+        developer_map = ensure_lookup(
+            cursor, "dds.dim_developer", "developer_id", "developer_name",
+            {value for row in source.values() for value in row["developers"]},
+        )
+        publisher_map = ensure_lookup(
+            cursor, "dds.dim_publisher", "publisher_id", "publisher_name",
+            {value for row in source.values() for value in row["publishers"]},
+        )
 
-    logger.info(f"Loaded {len(values)} games into dds.dim_game.")
-
-
-def sync_game_lookup(
-    source_column: str,
-    temp_table: str,
-    dimension_table: str,
-    dimension_id: str,
-    dimension_name: str,
-    bridge_table: str,
-    bridge_column: str,
-) -> int:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
         cursor.execute(
-            f"CREATE TEMP TABLE {temp_table} (appid BIGINT, value TEXT) ON COMMIT DROP;"
+            """
+            SELECT game_sk, appid, row_hash
+            FROM dds.dim_game
+            WHERE is_current;
+            """
         )
-        cursor.execute(f"SELECT appid, {source_column} FROM steam.ods_games;")
+        current = {
+            int(appid): (int(game_sk), row_hash)
+            for game_sk, appid, row_hash in cursor.fetchall()
+        }
 
-        pairs = []
-        for appid, raw_value in cursor.fetchall():
-            values = split_csv(raw_value)
-            if not values:
-                pairs.append((int(appid), None))
+        inserted_versions = 0
+        changed_versions = 0
+        unchanged_versions = 0
+
+        for appid, row in source.items():
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s));", (str(appid),))
+            current_row = current.get(appid)
+
+            if current_row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO dds.dim_game (
+                        appid, name, is_free, release_date, short_description,
+                        row_hash, valid_from, valid_to, is_current
+                    ) VALUES (%s, %s, %s, %s, %s, %s, '-infinity', 'infinity', true)
+                    RETURNING game_sk;
+                    """,
+                    (
+                        appid, row["name"], row["is_free"], row["release_date"],
+                        row["short_description"], row["row_hash"],
+                    ),
+                )
+                game_sk = cursor.fetchone()[0]
+                inserted_versions += 1
             else:
-                pairs.extend((int(appid), value) for value in values)
+                game_sk, current_hash = current_row
+                if current_hash != row["row_hash"]:
+                    cursor.execute(
+                        """
+                        SELECT game_sk, row_hash
+                        FROM dds.dim_game
+                        WHERE appid = %s AND is_current
+                        FOR UPDATE;
+                        """,
+                        (appid,),
+                    )
+                    locked = cursor.fetchone()
+                    if locked and locked[1] != row["row_hash"]:
+                        cursor.execute(
+                            """
+                            UPDATE dds.dim_game
+                            SET is_current = false, valid_to = now()
+                            WHERE game_sk = %s;
+                            """,
+                            (locked[0],),
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO dds.dim_game (
+                                appid, name, is_free, release_date, short_description,
+                                row_hash, valid_from, valid_to, is_current
+                            ) VALUES (%s, %s, %s, %s, %s, %s, now(), 'infinity', true)
+                            RETURNING game_sk;
+                            """,
+                            (
+                                appid, row["name"], row["is_free"], row["release_date"],
+                                row["short_description"], row["row_hash"],
+                            ),
+                        )
+                        game_sk = cursor.fetchone()[0]
+                        changed_versions += 1
+                    elif locked:
+                        game_sk = locked[0]
+                        unchanged_versions += 1
+                else:
+                    unchanged_versions += 1
 
-        if not pairs:
-            conn.commit()
-            return 0
-
-        cursor.executemany(
-            f"INSERT INTO {temp_table} (appid, value) VALUES (%s, %s);",
-            pairs,
-        )
-
-        cursor.execute(
-            f"""
-            INSERT INTO {dimension_table} ({dimension_name})
-            SELECT DISTINCT value
-            FROM {temp_table}
-            WHERE value IS NOT NULL
-            ON CONFLICT ({dimension_name}) DO NOTHING;
-            """
-        )
-
-        cursor.execute(
-            f"""
-            DELETE FROM {bridge_table} b
-            USING (SELECT DISTINCT appid FROM {temp_table}) t
-            WHERE b.appid = t.appid;
-            """
-        )
-
-        cursor.execute(
-            f"""
-            INSERT INTO {bridge_table} (appid, {bridge_column})
-            SELECT t.appid, d.{dimension_id}
-            FROM {temp_table} t
-            JOIN {dimension_table} d ON d.{dimension_name} = t.value
-            ON CONFLICT DO NOTHING;
-            """
-        )
+            sync_bridges(
+                cursor, "dds.bridge_game_genre", "genre_id", game_sk,
+                {genre_map[name] for name in row["genres"] if name in genre_map},
+            )
+            sync_bridges(
+                cursor, "dds.bridge_game_developer", "developer_id", game_sk,
+                {developer_map[name] for name in row["developers"] if name in developer_map},
+            )
+            sync_bridges(
+                cursor, "dds.bridge_game_publisher", "publisher_id", game_sk,
+                {publisher_map[name] for name in row["publishers"] if name in publisher_map},
+            )
 
         conn.commit()
     except Exception:
@@ -187,61 +250,56 @@ def sync_game_lookup(
         cursor.close()
         conn.close()
 
-    return len(pairs)
-
-
-def load_dim_genre(**context) -> None:
-    count = sync_game_lookup(
-        source_column="genres",
-        temp_table="tmp_game_genre",
-        dimension_table="dds.dim_genre",
-        dimension_id="genre_id",
-        dimension_name="genre_name",
-        bridge_table="dds.bridge_game_genre",
-        bridge_column="genre_id",
+    logger.info(
+        f"SCD2 dim_game: inserted={inserted_versions}, changed={changed_versions}, "
+        f"unchanged={unchanged_versions}."
     )
-    logger.info(f"Synchronized {count} game-genre rows.")
-
-
-def load_dim_developer(**context) -> None:
-    count = sync_game_lookup(
-        source_column="developers",
-        temp_table="tmp_game_developer",
-        dimension_table="dds.dim_developer",
-        dimension_id="developer_id",
-        dimension_name="developer_name",
-        bridge_table="dds.bridge_game_developer",
-        bridge_column="developer_id",
-    )
-    logger.info(f"Synchronized {count} game-developer rows.")
-
-
-def load_dim_publisher(**context) -> None:
-    count = sync_game_lookup(
-        source_column="publishers",
-        temp_table="tmp_game_publisher",
-        dimension_table="dds.dim_publisher",
-        dimension_id="publisher_id",
-        dimension_name="publisher_name",
-        bridge_table="dds.bridge_game_publisher",
-        bridge_column="publisher_id",
-    )
-    logger.info(f"Synchronized {count} game-publisher rows.")
 
 
 def validate_game_dimensions(**context) -> None:
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT count(*) FROM dds.dim_game;")
-        games = cursor.fetchone()[0]
+        cursor.execute("SELECT count(*) FROM dds.dim_game WHERE is_current;")
+        current_games = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM (
+                SELECT appid
+                FROM dds.dim_game
+                WHERE is_current
+                GROUP BY appid
+                HAVING count(*) > 1
+            ) duplicates;
+            """
+        )
+        duplicate_current = cursor.fetchone()[0]
+
+        cursor.execute("SELECT count(*) FROM dds.dim_game WHERE valid_to <= valid_from;")
+        invalid_intervals = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM dds.dim_game a
+            JOIN dds.dim_game b
+              ON a.appid = b.appid
+             AND a.game_sk < b.game_sk
+             AND a.valid_from < b.valid_to
+             AND b.valid_from < a.valid_to;
+            """
+        )
+        overlapping_intervals = cursor.fetchone()[0]
 
         cursor.execute(
             """
             SELECT count(*)
             FROM steam.ods_games o
-            LEFT JOIN dds.dim_game g ON g.appid = o.appid
-            WHERE g.appid IS NULL;
+            LEFT JOIN dds.dim_game g
+              ON g.appid = o.appid AND g.is_current
+            WHERE g.game_sk IS NULL;
             """
         )
         missing_games = cursor.fetchone()[0]
@@ -249,68 +307,31 @@ def validate_game_dimensions(**context) -> None:
         cursor.execute(
             """
             SELECT count(*)
-            FROM steam.ods_games o
-            WHERE o.genres IS NOT NULL
-              AND o.genres <> ''
-              AND NOT EXISTS (
-                  SELECT 1 FROM dds.bridge_game_genre b WHERE b.appid = o.appid
-              );
+            FROM dds.bridge_game_genre b
+            LEFT JOIN dds.dim_game g ON g.game_sk = b.game_sk
+            LEFT JOIN dds.dim_genre d ON d.genre_id = b.genre_id
+            WHERE g.game_sk IS NULL OR d.genre_id IS NULL;
             """
         )
-        missing_genres = cursor.fetchone()[0]
-
-        cursor.execute(
-            """
-            SELECT count(*)
-            FROM steam.ods_games o
-            WHERE o.developers IS NOT NULL
-              AND o.developers <> ''
-              AND NOT EXISTS (
-                  SELECT 1 FROM dds.bridge_game_developer b WHERE b.appid = o.appid
-              );
-            """
-        )
-        missing_developers = cursor.fetchone()[0]
-
-        cursor.execute(
-            """
-            SELECT count(*)
-            FROM steam.ods_games o
-            WHERE o.publishers IS NOT NULL
-              AND o.publishers <> ''
-              AND NOT EXISTS (
-                  SELECT 1 FROM dds.bridge_game_publisher b WHERE b.appid = o.appid
-              );
-            """
-        )
-        missing_publishers = cursor.fetchone()[0]
-
-        cursor.execute("SELECT count(*) FROM dds.dim_genre;")
-        genres = cursor.fetchone()[0]
-        cursor.execute("SELECT count(*) FROM dds.dim_developer;")
-        developers = cursor.fetchone()[0]
-        cursor.execute("SELECT count(*) FROM dds.dim_publisher;")
-        publishers = cursor.fetchone()[0]
+        broken_genre_bridges = cursor.fetchone()[0]
     finally:
         cursor.close()
         conn.close()
 
-    if games == 0:
-        raise AirflowException("dds.dim_game is empty after load.")
+    if current_games == 0:
+        raise AirflowException("dds.dim_game has no current rows.")
+    if duplicate_current:
+        raise AirflowException(f"{duplicate_current} appids have multiple current versions.")
+    if invalid_intervals:
+        raise AirflowException(f"{invalid_intervals} dim_game rows have invalid intervals.")
+    if overlapping_intervals:
+        raise AirflowException(f"{overlapping_intervals} dim_game version pairs overlap.")
     if missing_games:
         raise AirflowException(f"{missing_games} ODS games are missing in dds.dim_game.")
+    if broken_genre_bridges:
+        raise AirflowException(f"{broken_genre_bridges} broken game-genre bridges.")
 
-    if missing_genres:
-        logger.warning(f"{missing_genres} games have no genre bridge rows.")
-    if missing_developers:
-        logger.warning(f"{missing_developers} games have no developer bridge rows.")
-    if missing_publishers:
-        logger.warning(f"{missing_publishers} games have no publisher bridge rows.")
-
-    logger.info(
-        f"Game dimensions: games={games}, genres={genres}, "
-        f"developers={developers}, publishers={publishers}."
-    )
+    logger.info(f"SCD2 dim_game validation passed: {current_games} current games.")
 
 
 default_args = {
@@ -324,24 +345,24 @@ default_args = {
 with DAG(
     dag_id="dds_game_dimensions_dag",
     default_args=default_args,
-    description="Load game, genre, developer and publisher DDS dimensions",
+    description="SCD2 dimensions for games, genres, developers and publishers",
     schedule="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=["steam", "dds", "dimensions", "games"],
+    tags=["steam", "dds", "dimensions", "scd2", "games"],
     doc_md="""
-### DDS Game Dimensions
+### DDS Game Dimensions (SCD2)
 
-Загружает измерения, зависящие от каталога Steam:
-- `dds.dim_game` из `steam.ods_games`;
-- `dds.dim_genre` и `dds.bridge_game_genre`;
-- `dds.dim_developer` и `dds.bridge_game_developer`;
-- `dds.dim_publisher` и `dds.bridge_game_publisher`.
+Загружает:
+- `dds.dim_game` с историей версий и `valid_from` / `valid_to` / `is_current`;
+- `dds.dim_genre`, `dds.dim_developer`, `dds.dim_publisher`;
+- bridge-таблицы, привязанные к `game_sk`.
 
-**Запуск:** после успешного завершения `steam_games_catalog_etl` за тот же logical date.
-**Идемпотентность:** upsert по бизнес-ключам и полная пересинхронизация bridge-таблиц
-для игр из текущего ODS-снимка.
+Изменение атрибутов игры или её жанров/разработчиков/издателей закрывает текущую
+версию и создаёт новую. Неизменённые игры не версионируются.
+
+**Запуск:** после `steam_games_catalog_etl` за тот же logical date.
 """,
 ) as dag:
 
@@ -362,24 +383,9 @@ with DAG(
         python_callable=check_ods_games,
     )
 
-    load_dim_game_task = PythonOperator(
-        task_id="load_dim_game",
-        python_callable=load_dim_game,
-    )
-
-    load_dim_genre_task = PythonOperator(
-        task_id="load_dim_genre",
-        python_callable=load_dim_genre,
-    )
-
-    load_dim_developer_task = PythonOperator(
-        task_id="load_dim_developer",
-        python_callable=load_dim_developer,
-    )
-
-    load_dim_publisher_task = PythonOperator(
-        task_id="load_dim_publisher",
-        python_callable=load_dim_publisher,
+    sync_game_dimensions_task = PythonOperator(
+        task_id="sync_game_dimensions",
+        python_callable=sync_game_dimensions,
     )
 
     validate_game_dimensions_task = PythonOperator(
@@ -387,9 +393,6 @@ with DAG(
         python_callable=validate_game_dimensions,
     )
 
-    wait_for_ods_catalog >> check_ods_games_task >> load_dim_game_task
-    load_dim_game_task >> [
-        load_dim_genre_task,
-        load_dim_developer_task,
-        load_dim_publisher_task,
-    ] >> validate_game_dimensions_task
+    wait_for_ods_catalog >> check_ods_games_task
+    check_ods_games_task >> sync_game_dimensions_task
+    sync_game_dimensions_task >> validate_game_dimensions_task

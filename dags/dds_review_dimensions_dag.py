@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from datetime import datetime, timedelta
 
@@ -14,8 +16,12 @@ POSTGRES_CONN_ID = "steam_postgres"
 
 
 def daily_slot(dt: datetime) -> datetime:
-    """Выравнивает logical date на полночь — сетку @daily DAG'ов."""
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def source_hash(*parts) -> str:
+    payload = json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
 def get_connection():
@@ -38,7 +44,7 @@ def check_ods_reviews(**context) -> None:
     logger.info(f"steam.ods_reviews contains {count} rows.")
 
 
-def load_dim_user(**context) -> None:
+def sync_dim_user(**context) -> None:
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -55,88 +61,84 @@ def load_dim_user(**context) -> None:
             """
         )
         rows = cursor.fetchall()
-
         if not rows:
             logger.warning("No numeric author_steamid values found in ODS reviews.")
             return
 
-        values = [
-            (int(steamid), int(num_reviews), int(playtime_forever))
-            for steamid, num_reviews, playtime_forever in rows
-        ]
-
-        cursor.executemany(
-            """
-            INSERT INTO dds.dim_user (
-                steamid, num_reviews, playtime_forever, last_seen_at
-            ) VALUES (%s, %s, %s, now())
-            ON CONFLICT (steamid) DO UPDATE SET
-                num_reviews = GREATEST(dds.dim_user.num_reviews, EXCLUDED.num_reviews),
-                playtime_forever = GREATEST(
-                    dds.dim_user.playtime_forever, EXCLUDED.playtime_forever
-                ),
-                last_seen_at = now();
-            """,
-            values,
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-    logger.info(f"Loaded {len(values)} users into dds.dim_user.")
-
-
-def load_dim_review(**context) -> None:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
         cursor.execute(
             """
-            INSERT INTO dds.dim_review (
-                review_id, language, review_text, steam_purchase,
-                received_for_free, written_during_early_access, refunded,
-                timestamp_created, timestamp_updated, author_playtime_at_review,
-                voted_up, votes_up, votes_funny, weighted_score,
-                comment_count, collected_at
+            CREATE TEMP TABLE tmp_user_source (
+                steamid BIGINT,
+                num_reviews INT,
+                playtime_forever INT,
+                row_hash TEXT
+            ) ON COMMIT DROP;
+            """
+        )
+
+        values = [
+            (int(steamid), int(num_reviews), int(playtime), source_hash(int(num_reviews), int(playtime)))
+            for steamid, num_reviews, playtime in rows
+        ]
+        cursor.executemany(
+            "INSERT INTO tmp_user_source (steamid, num_reviews, playtime_forever, row_hash) "
+            "VALUES (%s, %s, %s, %s);",
+            values,
+        )
+
+        cursor.execute(
+            """
+            UPDATE dds.dim_user d
+            SET is_current = false, valid_to = now()
+            FROM tmp_user_source s
+            WHERE d.steamid = s.steamid
+              AND d.is_current
+              AND d.row_hash <> s.row_hash;
+            """
+        )
+        closed = cursor.rowcount
+
+        cursor.execute(
+            """
+            UPDATE dds.dim_user d
+            SET last_seen_at = now()
+            FROM tmp_user_source s
+            WHERE d.steamid = s.steamid
+              AND d.is_current
+              AND d.row_hash = s.row_hash;
+            """
+        )
+        touched = cursor.rowcount
+
+        cursor.execute(
+            """
+            INSERT INTO dds.dim_user (
+                steamid, num_reviews, playtime_forever,
+                first_seen_at, last_seen_at, row_hash,
+                valid_from, valid_to, is_current
             )
             SELECT
-                review_id,
-                language,
-                review_text,
-                COALESCE(steam_purchase, false),
-                COALESCE(received_for_free, false),
-                COALESCE(written_during_early_access, false),
-                COALESCE(refunded, false),
-                timestamp_created,
-                timestamp_updated,
-                author_playtime_at_review,
-                COALESCE(voted_up, false),
-                votes_up,
-                votes_funny,
-                weighted_vote_score,
-                comment_count,
-                COALESCE(collected_at, now())
-            FROM steam.ods_reviews
-            ON CONFLICT (review_id) DO UPDATE SET
-                language = EXCLUDED.language,
-                review_text = EXCLUDED.review_text,
-                steam_purchase = EXCLUDED.steam_purchase,
-                received_for_free = EXCLUDED.received_for_free,
-                written_during_early_access = EXCLUDED.written_during_early_access,
-                refunded = EXCLUDED.refunded,
-                timestamp_created = EXCLUDED.timestamp_created,
-                timestamp_updated = EXCLUDED.timestamp_updated,
-                author_playtime_at_review = EXCLUDED.author_playtime_at_review,
-                voted_up = EXCLUDED.voted_up,
-                votes_up = EXCLUDED.votes_up,
-                votes_funny = EXCLUDED.votes_funny,
-                weighted_score = EXCLUDED.weighted_score,
-                comment_count = EXCLUDED.comment_count,
-                collected_at = EXCLUDED.collected_at;
+                s.steamid,
+                s.num_reviews,
+                s.playtime_forever,
+                COALESCE(
+                    (SELECT MIN(u.first_seen_at) FROM dds.dim_user u WHERE u.steamid = s.steamid),
+                    now()
+                ),
+                now(),
+                s.row_hash,
+                CASE
+                    WHEN EXISTS (SELECT 1 FROM dds.dim_user u WHERE u.steamid = s.steamid)
+                    THEN now()
+                    ELSE '-infinity'::timestamptz
+                END,
+                'infinity'::timestamptz,
+                true
+            FROM tmp_user_source s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dds.dim_user d
+                WHERE d.steamid = s.steamid AND d.is_current
+            );
             """
         )
         inserted = cursor.rowcount
@@ -148,42 +150,224 @@ def load_dim_review(**context) -> None:
         cursor.close()
         conn.close()
 
-    logger.info(f"Loaded {inserted} reviews into dds.dim_review.")
+    logger.info(
+        f"SCD2 dim_user: inserted={inserted}, closed={closed}, untouched={touched}."
+    )
+
+
+def sync_dim_review(**context) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT review_id, language, review_text, steam_purchase,
+                   received_for_free, written_during_early_access, refunded,
+                   timestamp_created, timestamp_updated, author_playtime_at_review,
+                   voted_up, votes_up, votes_funny, weighted_vote_score,
+                   comment_count, collected_at
+            FROM steam.ods_reviews;
+            """
+        )
+        raw_rows = cursor.fetchall()
+        if not raw_rows:
+            raise AirflowSkipException("steam.ods_reviews is empty.")
+
+        cursor.execute(
+            """
+            CREATE TEMP TABLE tmp_review_source (
+                review_id TEXT,
+                language VARCHAR(10),
+                review_text TEXT,
+                steam_purchase BOOLEAN,
+                received_for_free BOOLEAN,
+                written_during_early_access BOOLEAN,
+                refunded BOOLEAN,
+                timestamp_created TIMESTAMPTZ,
+                timestamp_updated TIMESTAMPTZ,
+                author_playtime_at_review BIGINT,
+                voted_up BOOLEAN,
+                votes_up INTEGER,
+                votes_funny INTEGER,
+                weighted_score NUMERIC(6, 5),
+                comment_count INTEGER,
+                collected_at TIMESTAMPTZ,
+                row_hash TEXT
+            ) ON COMMIT DROP;
+            """
+        )
+
+        values = []
+        for row in raw_rows:
+            (
+                review_id, language, review_text, steam_purchase, received_for_free,
+                written_during_early_access, refunded, timestamp_created,
+                timestamp_updated, author_playtime_at_review, voted_up,
+                votes_up, votes_funny, weighted_score, comment_count, collected_at,
+            ) = row
+            row_hash = source_hash(
+                language, review_text, steam_purchase, received_for_free,
+                written_during_early_access, refunded,
+                timestamp_created.isoformat() if timestamp_created else None,
+                timestamp_updated.isoformat() if timestamp_updated else None,
+                author_playtime_at_review, voted_up, votes_up, votes_funny,
+                weighted_score, comment_count,
+                collected_at.isoformat() if collected_at else None,
+            )
+            values.append((
+                review_id, language, review_text, steam_purchase, received_for_free,
+                written_during_early_access, refunded, timestamp_created,
+                timestamp_updated, author_playtime_at_review, voted_up,
+                votes_up, votes_funny, weighted_score, comment_count, collected_at,
+                row_hash,
+            ))
+
+        cursor.executemany(
+            """
+            INSERT INTO tmp_review_source (
+                review_id, language, review_text, steam_purchase, received_for_free,
+                written_during_early_access, refunded, timestamp_created,
+                timestamp_updated, author_playtime_at_review, voted_up,
+                votes_up, votes_funny, weighted_score, comment_count, collected_at,
+                row_hash
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """,
+            values,
+        )
+
+        cursor.execute(
+            """
+            UPDATE dds.dim_review d
+            SET is_current = false, valid_to = now()
+            FROM tmp_review_source s
+            WHERE d.review_id = s.review_id
+              AND d.is_current
+              AND d.row_hash <> s.row_hash;
+            """
+        )
+        closed = cursor.rowcount
+
+        cursor.execute(
+            """
+            INSERT INTO dds.dim_review (
+                review_id, language, review_text, steam_purchase, received_for_free,
+                written_during_early_access, refunded, timestamp_created,
+                timestamp_updated, author_playtime_at_review, voted_up,
+                votes_up, votes_funny, weighted_score, comment_count, collected_at,
+                row_hash, valid_from, valid_to, is_current
+            )
+            SELECT
+                s.review_id, s.language, s.review_text, s.steam_purchase,
+                s.received_for_free, s.written_during_early_access, s.refunded,
+                s.timestamp_created, s.timestamp_updated, s.author_playtime_at_review,
+                COALESCE(s.voted_up, false), s.votes_up, s.votes_funny,
+                s.weighted_score, s.comment_count, s.collected_at,
+                s.row_hash,
+                CASE
+                    WHEN EXISTS (SELECT 1 FROM dds.dim_review d WHERE d.review_id = s.review_id)
+                    THEN now()
+                    ELSE '-infinity'::timestamptz
+                END,
+                'infinity'::timestamptz,
+                true
+            FROM tmp_review_source s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dds.dim_review d
+                WHERE d.review_id = s.review_id AND d.is_current
+            );
+            """
+        )
+        inserted = cursor.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    logger.info(f"SCD2 dim_review: inserted={inserted}, closed={closed}.")
 
 
 def validate_review_dimensions(**context) -> None:
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT count(*) FROM dds.dim_review;")
-        reviews = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM (
+                SELECT review_id
+                FROM dds.dim_review
+                WHERE is_current
+                GROUP BY review_id
+                HAVING count(*) > 1
+            ) duplicates;
+            """
+        )
+        duplicate_reviews = cursor.fetchone()[0]
 
-        cursor.execute("SELECT count(*) FROM dds.dim_user;")
-        users = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM (
+                SELECT steamid
+                FROM dds.dim_user
+                WHERE is_current
+                GROUP BY steamid
+                HAVING count(*) > 1
+            ) duplicates;
+            """
+        )
+        duplicate_users = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM dds.dim_review
+            WHERE valid_to <= valid_from;
+            """
+        )
+        invalid_review_intervals = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM dds.dim_user
+            WHERE valid_to <= valid_from;
+            """
+        )
+        invalid_user_intervals = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM dds.dim_review a
+            JOIN dds.dim_review b
+              ON a.review_id = b.review_id
+             AND a.review_sk < b.review_sk
+             AND a.valid_from < b.valid_to
+             AND b.valid_from < a.valid_to;
+            """
+        )
+        overlapping_reviews = cursor.fetchone()[0]
 
         cursor.execute(
             """
             SELECT count(*)
             FROM steam.ods_reviews o
-            LEFT JOIN dds.dim_review r ON r.review_id = o.review_id
-            WHERE r.review_id IS NULL;
+            LEFT JOIN dds.dim_review r
+              ON r.review_id = o.review_id AND r.is_current
+            WHERE r.review_sk IS NULL;
             """
         )
         missing_reviews = cursor.fetchone()[0]
 
-        cursor.execute(
-            """
-            SELECT count(*)
-            FROM steam.ods_reviews o
-            WHERE o.author_steamid IS NOT NULL
-              AND o.author_steamid ~ '^[0-9]+$'
-              AND NOT EXISTS (
-                  SELECT 1 FROM dds.dim_user u
-                  WHERE u.steamid = o.author_steamid::bigint
-              );
-            """
-        )
-        missing_users = cursor.fetchone()[0]
+        cursor.execute("SELECT count(*) FROM dds.dim_review WHERE is_current;")
+        reviews = cursor.fetchone()[0]
+
+        cursor.execute("SELECT count(*) FROM dds.dim_user WHERE is_current;")
+        users = cursor.fetchone()[0]
 
         cursor.execute(
             """
@@ -199,19 +383,25 @@ def validate_review_dimensions(**context) -> None:
         conn.close()
 
     if reviews == 0:
-        raise AirflowException("dds.dim_review is empty after load.")
+        raise AirflowException("dds.dim_review has no current rows.")
+    if duplicate_reviews:
+        raise AirflowException(f"{duplicate_reviews} review_ids have multiple current versions.")
+    if duplicate_users:
+        raise AirflowException(f"{duplicate_users} steamids have multiple current versions.")
+    if invalid_review_intervals:
+        raise AirflowException(f"{invalid_review_intervals} dim_review rows have invalid intervals.")
+    if invalid_user_intervals:
+        raise AirflowException(f"{invalid_user_intervals} dim_user rows have invalid intervals.")
+    if overlapping_reviews:
+        raise AirflowException(f"{overlapping_reviews} dim_review version pairs overlap.")
     if missing_reviews:
-        raise AirflowException(
-            f"{missing_reviews} ODS reviews are missing in dds.dim_review."
-        )
+        raise AirflowException(f"{missing_reviews} ODS reviews are missing in dds.dim_review.")
 
-    if missing_users:
-        logger.warning(f"{missing_users} reviews reference missing dds.dim_user rows.")
     if invalid_authors:
         logger.warning(f"{invalid_authors} reviews have non-numeric author_steamid.")
 
     logger.info(
-        f"Review dimensions: reviews={reviews}, users={users}, "
+        f"SCD2 review dimensions validation passed: reviews={reviews}, users={users}, "
         f"invalid_authors={invalid_authors}."
     )
 
@@ -227,21 +417,23 @@ default_args = {
 with DAG(
     dag_id="dds_review_dimensions_dag",
     default_args=default_args,
-    description="Load user and review DDS dimensions from ODS reviews",
+    description="SCD2 dimensions for users and reviews",
     schedule="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=["steam", "dds", "dimensions", "reviews", "users"],
+    tags=["steam", "dds", "dimensions", "scd2", "reviews"],
     doc_md="""
-### DDS Review and User Dimensions
+### DDS Review and User Dimensions (SCD2)
 
-Загружает измерения из `steam.ods_reviews`:
-- `dds.dim_user` — уникальные авторы отзывов;
-- `dds.dim_review` — описательные атрибуты и меры отзывов.
+Загружает:
+- `dds.dim_user` с историей версий;
+- `dds.dim_review` с историей версий.
 
-**Запуск:** после успешного завершения `steam_reviews_collector` за тот же logical date.
-**Идемпотентность:** upsert по `steamid` и `review_id`.
+Изменение метрик пользователя или содержимого/голосов отзыва закрывает текущую
+версию и создаёт новую. Неизменённые записи не версионируются.
+
+**Запуск:** после `steam_reviews_collector` за тот же logical date.
 """,
 ) as dag:
 
@@ -262,14 +454,14 @@ with DAG(
         python_callable=check_ods_reviews,
     )
 
-    load_dim_user_task = PythonOperator(
-        task_id="load_dim_user",
-        python_callable=load_dim_user,
+    sync_dim_user_task = PythonOperator(
+        task_id="sync_dim_user",
+        python_callable=sync_dim_user,
     )
 
-    load_dim_review_task = PythonOperator(
-        task_id="load_dim_review",
-        python_callable=load_dim_review,
+    sync_dim_review_task = PythonOperator(
+        task_id="sync_dim_review",
+        python_callable=sync_dim_review,
     )
 
     validate_review_dimensions_task = PythonOperator(
@@ -278,5 +470,5 @@ with DAG(
     )
 
     wait_for_ods_reviews >> check_ods_reviews_task
-    check_ods_reviews_task >> [load_dim_user_task, load_dim_review_task]
-    [load_dim_user_task, load_dim_review_task] >> validate_review_dimensions_task
+    check_ods_reviews_task >> [sync_dim_user_task, sync_dim_review_task]
+    [sync_dim_user_task, sync_dim_review_task] >> validate_review_dimensions_task
