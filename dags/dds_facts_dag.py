@@ -29,8 +29,27 @@ def daily_slot(dt: datetime) -> datetime:
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def three_hour_slot(dt: datetime) -> datetime:
-    return dt.replace(hour=(dt.hour // 3) * 3, minute=0, second=0, microsecond=0)
+def three_hour_slots(dt: datetime, **context) -> list[datetime]:
+    end = context.get("data_interval_end") or dt
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    else:
+        end = end.astimezone(timezone.utc)
+
+    lookback = int((context.get("params") or {}).get("activity_lookback_days", 1))
+    start = (end - timedelta(days=lookback)).replace(
+        hour=((end - timedelta(days=lookback)).hour // 3) * 3,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    slots = []
+    current = start
+    while current < end:
+        slots.append(current)
+        current += timedelta(hours=3)
+    return slots
 
 
 def processed_dir(context) -> str:
@@ -480,7 +499,7 @@ with DAG(
         task_id="wait_for_ods_player_stats",
         external_dag_id="steam_player_stats_etl",
         external_task_id=None,
-        execution_date_fn=three_hour_slot,
+        execution_date_fn=three_hour_slots,
         allowed_states=["success"],
         mode="reschedule",
         poke_interval=60,

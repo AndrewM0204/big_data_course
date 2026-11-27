@@ -218,6 +218,10 @@ wait_for_ods_player_stats
 
 Источник онлайна — PostgreSQL `steam.ods_player_stats`, а не ClickHouse.
 
+Сенсор `wait_for_ods_player_stats` использует `execution_date_fn`, который возвращает
+все 8 logical dates окна активности (`00:00, 03:00, ..., 21:00`). Поэтому дневной
+факт не считается, пока не завершился последний трёхчасовой батч дня.
+
 ### 5.4. `data_quality_checks`
 
 Запускается после `dds_facts_dag` и выполняет шесть проверок:
