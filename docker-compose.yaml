@@ -43,6 +43,12 @@
 #                                Default: ''
 #
 # Feel free to modify this file to suit your needs.
+#
+# ЛР3: Superset и OpenMetadata добавлены в этот же compose (отдельного overlay нет).
+# Секреты обязательны и задаются в .env (шаблон — .env_lab3_example); без них
+# docker compose завершится ошибкой. Пароли не выводятся в логи.
+# Ресурсы: для полного стека нужно 6-8 ГБ RAM, выделенных Docker; тяжёлым
+# сервисам задан mem_limit, чтобы один контейнер не занял всю память.
 ---
 x-airflow-common:
   &airflow-common
@@ -51,20 +57,22 @@ x-airflow-common:
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
   image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.2}
   # build: .
-  env_file:
-    - ${ENV_FILE_PATH:-.env}
   environment:
     &airflow-common-env
+    # Airflow получает только явно перечисленные переменные; секреты ЛР3
+    # из .env не попадают в контейнеры Airflow.
+    AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    STEAM_API_KEY: ${STEAM_API_KEY:-}
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
-    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:?Задайте FERNET_KEY в .env}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
-    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:?Задайте AIRFLOW__API_AUTH__JWT_SECRET в .env}
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
@@ -84,6 +92,8 @@ x-airflow-common:
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+    # Единый DDL ЛР3 доступен Airflow только для чтения.
+    - ${AIRFLOW_PROJ_DIR:-.}/sql:/opt/airflow/sql:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -91,6 +101,48 @@ x-airflow-common:
       condition: service_healthy
     postgres:
       condition: service_healthy
+
+x-openmetadata-env: &openmetadata-env
+  OPENMETADATA_CLUSTER_NAME: ${OPENMETADATA_CLUSTER_NAME:-openmetadata}
+  SERVER_PORT: "8585"
+  SERVER_ADMIN_PORT: "8586"
+  LOG_LEVEL: INFO
+  AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
+  AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
+  AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+  AUTHORIZER_ALLOWED_REGISTRATION_DOMAIN: '["all"]'
+  AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
+  AUTHORIZER_PRINCIPAL_DOMAIN: open-metadata.org
+  AUTHORIZER_ALLOWED_DOMAINS: "[]"
+  AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "false"
+  AUTHORIZER_ENABLE_SECURE_SOCKET: "false"
+  AUTHENTICATION_PROVIDER: basic
+  AUTHENTICATION_ENABLE_SELF_SIGNUP: "false"
+  DB_DRIVER_CLASS: org.postgresql.Driver
+  DB_SCHEME: postgresql
+  DB_PARAMS: allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+  DB_USE_SSL: "false"
+  DB_USER: ${LR3_OM_DB_USER:-lab3_openmetadata}
+  DB_USER_PASSWORD: ${LR3_OM_DB_PASSWORD:?Задайте LR3_OM_DB_PASSWORD в .env}
+  DB_HOST: openmetadata-db
+  DB_PORT: "5432"
+  OM_DATABASE: ${LR3_OM_DB_NAME:-lab3_openmetadata}
+  ELASTICSEARCH_HOST: opensearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+  ELASTICSEARCH_USER: ""
+  ELASTICSEARCH_PASSWORD: ""
+  SEARCH_TYPE: opensearch
+  ELASTICSEARCH_CLUSTER_ALIAS: openmetadata
+  PIPELINE_SERVICE_CLIENT_SECRETS_MANAGER_LOADER: noop
+  PIPELINE_SERVICE_CLIENT_VERIFY_SSL: no-ssl
+  OPENMETADATA_HEAP_OPTS: -Xmx2g -Xms1g
+  MASK_PASSWORDS_API: "true"
+  OM_ADMIN_EMAIL: ${OM_ADMIN_EMAIL:-admin@open-metadata.org}
+  OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?Задайте OM_ADMIN_PASSWORD в .env}
+  # Псевдонимы для совместимости с ingestion/lineage обёртками.
+  OPENMETADATA_ADMIN_EMAIL: ${OM_ADMIN_EMAIL:-admin@open-metadata.org}
+  OPENMETADATA_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?Задайте OM_ADMIN_PASSWORD в .env}
 
 services:
   postgres:
@@ -110,6 +162,7 @@ services:
     restart: always
     ports:
       - 127.0.0.1:5433:5432
+    mem_limit: 2g
 
   redis:
     # Redis is limited to 7.2-bookworm due to licencing change
@@ -129,7 +182,7 @@ services:
     <<: *airflow-common
     command: api-server
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
       interval: 30s
@@ -282,7 +335,8 @@ services:
         echo
         echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID:-50000}:0"
         echo
-        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+        # /opt/airflow/sql смонтирован только для чтения; ошибку chown не считаем фатальной.
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/ 2>/dev/null || true
         echo
         echo "Change ownership of files in shared volumes to ${AIRFLOW_UID:-50000}:0"
         echo
@@ -326,7 +380,7 @@ services:
     profiles:
       - flower
     ports:
-      - "5555:5555"
+      - "127.0.0.1:5555:5555"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
       interval: 30s
@@ -338,20 +392,223 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+  lab3-db-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+      PGPASSWORD: airflow
+      LR3_SUPERSET_DB_USER: ${LR3_SUPERSET_DB_USER:-lab3_superset}
+      LR3_SUPERSET_DB_NAME: ${LR3_SUPERSET_DB_NAME:-lab3_superset}
+      LR3_SUPERSET_DB_PASSWORD: ${LR3_SUPERSET_DB_PASSWORD:?Задайте LR3_SUPERSET_DB_PASSWORD в .env}
+      LR3_SUPERSET_READER_PASSWORD: ${LR3_SUPERSET_READER_PASSWORD:?Задайте LR3_SUPERSET_READER_PASSWORD в .env}
+      # Имя переменной ожидает lab3/bi/sql/10_create_superset_reader.sql.
+      SUPERSET_READER_PASSWORD: ${LR3_SUPERSET_READER_PASSWORD:?Задайте LR3_SUPERSET_READER_PASSWORD в .env}
+    volumes:
+      # Скрипт вне /docker-entrypoint-initdb.d: postgres не запускает его сам.
+      - ./docker/lab3/db-init:/scripts:ro
+      - ./sql/marts:/marts:ro
+      - ./lab3/bi/sql:/bi:ro
+    entrypoint: ["/bin/bash", "/scripts/zz_init_lab3_superset.sh"]
+    restart: "no"
+    mem_limit: 256m
+
+  superset:
+    build:
+      context: ./docker/superset
+      args:
+        SUPERSET_IMAGE: ${SUPERSET_IMAGE:-apache/superset:4.1.2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lab3-db-init:
+        condition: service_completed_successfully
+    environment:
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: ${LR3_SUPERSET_SECRET_KEY:?Задайте LR3_SUPERSET_SECRET_KEY в .env}
+      SUPERSET_DB_HOST: postgres
+      SUPERSET_DB_PORT: "5432"
+      SUPERSET_DB_USER: ${LR3_SUPERSET_DB_USER:-lab3_superset}
+      SUPERSET_DB_PASSWORD: ${LR3_SUPERSET_DB_PASSWORD:?Задайте LR3_SUPERSET_DB_PASSWORD в .env}
+      SUPERSET_DB_NAME: ${LR3_SUPERSET_DB_NAME:-lab3_superset}
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_ENV: production
+      SUPERSET_WORKERS: ${SUPERSET_WORKERS:-2}
+      SUPERSET_ADMIN_USERNAME: ${LR3_SUPERSET_ADMIN_USER:-lab3_admin}
+      SUPERSET_ADMIN_FIRSTNAME: ${SUPERSET_ADMIN_FIRSTNAME:-Superset}
+      SUPERSET_ADMIN_LASTNAME: ${SUPERSET_ADMIN_LASTNAME:-Admin}
+      SUPERSET_ADMIN_EMAIL: ${LR3_SUPERSET_ADMIN_EMAIL:-admin@example.invalid}
+      SUPERSET_ADMIN_PASSWORD: ${LR3_SUPERSET_ADMIN_PASSWORD:?Задайте LR3_SUPERSET_ADMIN_PASSWORD в .env}
+      # Переменные читает lab3/bi/superset/bootstrap_superset.py.
+      LR3_SUPERSET_ADMIN_USER: ${LR3_SUPERSET_ADMIN_USER:-lab3_admin}
+      LR3_SUPERSET_ADMIN_PASSWORD: ${LR3_SUPERSET_ADMIN_PASSWORD:?Задайте LR3_SUPERSET_ADMIN_PASSWORD в .env}
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - superset_home:/app/superset_home
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8088/health', timeout=5).read()\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: always
+    mem_limit: 2g
+
+  openmetadata-db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_USER: ${LR3_OM_DB_USER:-lab3_openmetadata}
+      POSTGRES_PASSWORD: ${LR3_OM_DB_PASSWORD:?Задайте LR3_OM_DB_PASSWORD в .env}
+      POSTGRES_DB: ${LR3_OM_DB_NAME:-lab3_openmetadata}
+    volumes:
+      - openmetadata_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LR3_OM_DB_USER:-lab3_openmetadata} -d ${LR3_OM_DB_NAME:-lab3_openmetadata}"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+    mem_limit: 1g
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    restart: always
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      plugins.security.disabled: "true"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD:?Задайте OPENSEARCH_INITIAL_ADMIN_PASSWORD в .env}
+      indices.query.bool.max_clause_count: "4096"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(green|yellow)\"' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+    mem_limit: 2g
+
+  openmetadata-migrate:
+    image: openmetadata/server:1.8.0
+    working_dir: /opt/openmetadata
+    command: ["./bootstrap/openmetadata-ops.sh", "-d", "migrate", "--force"]
+    environment:
+      <<: *openmetadata-env
+    depends_on:
+      openmetadata-db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: "no"
+    mem_limit: 3g
+
+  openmetadata-server:
+    image: openmetadata/server:1.8.0
+    restart: always
+    environment:
+      <<: *openmetadata-env
+      SERVER_HOST_API_URL: http://openmetadata-server:8585/api
+    ports:
+      - "127.0.0.1:8585:8585"
+    depends_on:
+      openmetadata-db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8586/healthcheck || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    mem_limit: 3g
+
+  openmetadata-ingestion:
+    image: openmetadata/ingestion:1.8.0
+    profiles:
+      - ingestion
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openmetadata-server:
+        condition: service_healthy
+    environment:
+      OM_SERVER_URL: http://openmetadata-server:8585/api
+      OM_ADMIN_EMAIL: ${OM_ADMIN_EMAIL:-admin@open-metadata.org}
+      OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?Задайте OM_ADMIN_PASSWORD в .env}
+      OPENMETADATA_ADMIN_EMAIL: ${OM_ADMIN_EMAIL:-admin@open-metadata.org}
+      OPENMETADATA_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?Задайте OM_ADMIN_PASSWORD в .env}
+      OM_POSTGRES_SERVICE: ${OM_POSTGRES_SERVICE:-steam-postgres}
+      OM_POSTGRES_HOST: ${OM_POSTGRES_HOST:-postgres}
+      OM_POSTGRES_PORT: ${OM_POSTGRES_PORT:-5432}
+      OM_POSTGRES_DB: ${OM_POSTGRES_DB:-airflow}
+      OM_POSTGRES_USER: ${OM_POSTGRES_USER:-om_reader}
+      OM_POSTGRES_PASSWORD: ${OM_POSTGRES_PASSWORD:?Задайте OM_POSTGRES_PASSWORD в .env}
+    volumes:
+      - ./openmetadata/ingestion:/ingestion:ro
+    entrypoint: ["/bin/bash", "/ingestion/ingest-postgres.sh"]
+    # Не наследуем CMD образа: запускается только entrypoint.
+    command: []
+    restart: "no"
+    mem_limit: 2g
+
+  openmetadata-lineage:
+    image: openmetadata/ingestion:1.8.0
+    profiles:
+      - lineage
+    depends_on:
+      openmetadata-server:
+        condition: service_healthy
+    environment:
+      OM_SERVER_URL: http://openmetadata-server:8585/api
+      OM_ADMIN_EMAIL: ${OM_ADMIN_EMAIL:-admin@open-metadata.org}
+      OM_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?Задайте OM_ADMIN_PASSWORD в .env}
+      OPENMETADATA_ADMIN_EMAIL: ${OM_ADMIN_EMAIL:-admin@open-metadata.org}
+      OPENMETADATA_ADMIN_PASSWORD: ${OM_ADMIN_PASSWORD:?Задайте OM_ADMIN_PASSWORD в .env}
+      OM_POSTGRES_SERVICE: ${OM_POSTGRES_SERVICE:-steam-postgres}
+      OM_POSTGRES_DB: ${OM_POSTGRES_DB:-airflow}
+      OM_WITH_DASHBOARD: ${OM_WITH_DASHBOARD:-1}
+      # Каноническая декларация lineage ЛР3 (lab3/metadata/lineage).
+      OM_LINEAGE_DECLARATION: /lineage/lineage.json
+    volumes:
+      - ./openmetadata/ingestion:/ingestion:ro
+      - ./lab3/metadata/lineage:/lineage:ro
+    entrypoint: ["python", "/ingestion/lineage.py"]
+    # Не наследуем CMD образа: запускается только entrypoint.
+    command: []
+    restart: "no"
+    mem_limit: 2g
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     restart: always
     ports:
-      - "8123:8123"
-      - "9005:9000"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9005:9000"
     environment:
       CLICKHOUSE_USER: airflow
       CLICKHOUSE_PASSWORD: airflow
       CLICKHOUSE_DB: steam
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
+      # ./sql/clickhouse отсутствует в репозитории; схема создаётся DAG ЛР1.
       - clickhouse_data:/var/lib/clickhouse
-      - ./sql/clickhouse:/docker-entrypoint-initdb.d
     ulimits:
       nofile:
         soft: 262144
@@ -362,7 +619,11 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    mem_limit: 2g
 
 volumes:
   postgres-db-volume:
   clickhouse_data:
+  superset_home:
+  openmetadata_db_data:
+  opensearch_data:
