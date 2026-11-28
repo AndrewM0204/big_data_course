@@ -1,0 +1,31 @@
+source:
+  type: airflow
+  serviceName: steam-airflow
+  serviceConnection:
+    config:
+      type: Airflow
+      hostPort: http://airflow-apiserver:8080
+      numberOfStatus: 10
+      connection:
+        type: Postgres
+        username: airflow
+        authType:
+          password: airflow
+        database: airflow
+        hostPort: postgres:5432
+
+  sourceConfig:
+    config:
+      type: PipelineMetadata
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: http://openmetadata-server:8585/api
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: __OM_JWT_TOKEN__

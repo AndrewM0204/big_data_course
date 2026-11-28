@@ -1,0 +1,39 @@
+# Шаблон OpenMetadata PostgreSQL ingestion.
+# Плейсхолдеры __...__ подставляет ingest-postgres.sh из окружения;
+# реальные логины и пароли в файле не хранятся.
+source:
+  type: postgres
+  serviceName: "__OM_POSTGRES_SERVICE__"
+  serviceConnection:
+    config:
+      type: Postgres
+      username: "__OM_POSTGRES_USER__"
+      authType:
+        password: "__OM_POSTGRES_PASSWORD__"
+      hostPort: "__OM_POSTGRES_HOST__:__OM_POSTGRES_PORT__"
+      database: "__OM_POSTGRES_DB__"
+      ingestAllDatabases: false
+      sslMode: disable
+  sourceConfig:
+    config:
+      type: DatabaseMetadata
+      markDeletedTables: false
+      includeTables: true
+      includeViews: true
+      schemaFilterPattern:
+        includes:
+          - steam
+          - dds
+          - marts
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  loggerLevel: INFO
+  openMetadataServerConfig:
+    hostPort: "__OM_SERVER_URL__"
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "__OM_JWT_TOKEN__"
