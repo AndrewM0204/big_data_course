@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # BI-этап ЛР3: представления, роль чтения и Superset-объекты.
 # Работает с базовым docker-compose.yaml (сервисы postgres и superset).
 # Секреты берутся из окружения или .env и не печатаются.

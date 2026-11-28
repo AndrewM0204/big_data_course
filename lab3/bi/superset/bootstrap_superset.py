@@ -13,6 +13,7 @@
 скрипт завершается ненулевым кодом, если что-то не создано.
 """
 
+import http.cookiejar
 import json
 import os
 import sys
@@ -56,6 +57,8 @@ UPDATE_EXISTING = os.environ.get("SUPERSET_UPDATE_EXISTING", "0") == "1"
 
 TOKEN = ""
 CSRF_TOKEN = ""
+COOKIE_JAR = http.cookiejar.CookieJar()
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIE_JAR))
 
 
 def build_marts_uri():
@@ -109,7 +112,7 @@ def api(method, path, body=None, expected=(200,), auth=True):
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with OPENER.open(request, timeout=60) as response:
             status = response.status
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
@@ -161,7 +164,7 @@ def login():
 
 
 def find_entity(endpoint, column, value):
-    filters = [{"col": column, "op": "eq", "value": value}]
+    filters = [{"col": column, "opr": "eq", "value": value}]
     query = urllib.parse.quote(
         json.dumps(
             {"filters": filters, "page_size": 100},

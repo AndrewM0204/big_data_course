@@ -459,12 +459,14 @@ def rebuild_marts(**context) -> dict:
     # параллельных ETL. DELETE + INSERT + DQ + audit входят в одну
     # транзакцию: commit публикует всё сразу, rollback не оставляет
     # полупустых витрин и не пишет успешный аудит.
-    conn.set_session(isolation_level="REPEATABLE READ")
     counters = {}
     results = []
     error = None
     cursor = conn.cursor()
     try:
+        # Works for both psycopg2 and psycopg3 and must be the first
+        # statement in the transaction.
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
         acquire_publish_locks(cursor)
 
         # Полный идемпотентный пересчёт: витрины очищаются целиком и
@@ -648,7 +650,7 @@ Coverage отзывов использует `timestamp_created IS NOT NULL`; п
         external_dag_id="dds_facts_dag",
         external_task_id=None,
         allowed_states=["success"],
-        failed_states=["failed", "upstream_failed"],
+        failed_states=["failed"],
         mode="reschedule",
         poke_interval=60,
         timeout=timedelta(hours=6),
