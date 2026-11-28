@@ -543,27 +543,31 @@ CHARTS = [
         },
     },
     {
-        "name": "Динамика отзывов и доли положительных",
+        "name": "Динамика отзывов",
         "table": "bi_reviews_daily",
-        "viz_type": "mixed_timeseries",
+        "viz_type": "echarts_timeseries_bar",
         "description": (
-            "Столбцы — число текущих отзывов, линия — доля положительных. "
-            "Оценка отзыва текущая, а не восстановленная на историческую дату."
+            "Число текущих отзывов по дате создания за последние 90 дней. "
+            "Дни с менее чем 10 отзывами исключены из графика."
         ),
         "params": {
             "x_axis": "activity_date",
+            "granularity_sqla": "activity_date",
             "time_grain_sqla": "P1D",
+            "time_range": "Last 90 days",
+            "adhoc_filters": [
+                {
+                    "expressionType": "SQL",
+                    "sqlExpression": "review_count >= 10",
+                    "clause": "WHERE",
+                }
+            ],
             "metrics": [
                 metric("review_count", "MAX", "Отзывы"),
             ],
-            "metrics_b": [
-                metric("positive_ratio", "MAX", "Доля положительных"),
-            ],
-            "seriesType": "bar",
-            "seriesTypeB": "line",
+            "groupby": [],
             "y_axis_format": ",d",
-            "y_axis_format_secondary": ".1%",
-            "show_legend": True,
+            "show_legend": False,
             "rich_tooltip": True,
             "row_limit": 10000,
         },
