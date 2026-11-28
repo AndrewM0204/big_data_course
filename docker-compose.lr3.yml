@@ -1,0 +1,157 @@
+# Только локальная разработка; конфигурация не проверена запуском.
+# Запускать вместе с docker-compose.yaml. Рекомендуется не менее 8 ГБ RAM для Docker.
+# Добавить переменные из .env_lab3_example в игнорируемый git файл .env.
+# Compose: -f docker-compose.yaml -f docker-compose.lr3.yml --profile lr3
+# Для ingestion дополнительно включить --profile ingestion; профиль lr3 обязателен.
+x-openmetadata-env: &openmetadata-env
+  OPENMETADATA_CLUSTER_NAME: openmetadata
+  DB_DRIVER_CLASS: org.postgresql.Driver
+  DB_SCHEME: postgresql
+  DB_PARAMS: allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+  DB_USE_SSL: "false"
+  DB_HOST: lr3-openmetadata-db
+  DB_PORT: "5432"
+  DB_USER: ${LR3_OM_DB_USER:?Set LR3_OM_DB_USER}
+  DB_USER_PASSWORD: ${LR3_OM_DB_PASSWORD:?Set LR3_OM_DB_PASSWORD}
+  OM_DATABASE: ${LR3_OM_DB_NAME:?Set LR3_OM_DB_NAME}
+  SEARCH_TYPE: opensearch
+  ELASTICSEARCH_HOST: lr3-opensearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+  ELASTICSEARCH_CLUSTER_ALIAS: openmetadata
+  AUTHENTICATION_PROVIDER: basic
+  AUTHENTICATION_ENABLE_SELF_SIGNUP: "false"
+  AUTHORIZER_CLASS_NAME: org.openmetadata.service.security.DefaultAuthorizer
+  AUTHORIZER_REQUEST_FILTER: org.openmetadata.service.security.JwtFilter
+  AUTHORIZER_ADMIN_PRINCIPALS: "[admin]"
+  AUTHORIZER_INGESTION_PRINCIPALS: "[ingestion-bot]"
+  AUTHORIZER_PRINCIPAL_DOMAIN: open-metadata.org
+  AUTHORIZER_ALLOWED_DOMAINS: "[]"
+  AUTHORIZER_ENFORCE_PRINCIPAL_DOMAIN: "false"
+  PIPELINE_SERVICE_CLIENT_SECRETS_MANAGER_LOADER: noop
+  PIPELINE_SERVICE_CLIENT_VERIFY_SSL: no-ssl
+  OPENMETADATA_HEAP_OPTS: -Xmx2g -Xms1g
+  MASK_PASSWORDS_API: "true"
+
+services:
+  lr3-superset-db:
+    image: postgres:16.6
+    profiles: [lr3]
+    environment:
+      POSTGRES_USER: ${LR3_SUPERSET_DB_USER:?Set LR3_SUPERSET_DB_USER}
+      POSTGRES_PASSWORD: ${LR3_SUPERSET_DB_PASSWORD:?Set LR3_SUPERSET_DB_PASSWORD}
+      POSTGRES_DB: ${LR3_SUPERSET_DB_NAME:?Set LR3_SUPERSET_DB_NAME}
+    volumes:
+      - lr3-superset-db:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  lr3-superset-init:
+    build: ./docker/lab3/superset
+    image: lr3-superset:4.1.2
+    profiles: [lr3]
+    environment: &superset-env
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      SUPERSET_SECRET_KEY: ${LR3_SUPERSET_SECRET_KEY:?Set LR3_SUPERSET_SECRET_KEY}
+      LR3_SUPERSET_DB_USER: ${LR3_SUPERSET_DB_USER:?Set LR3_SUPERSET_DB_USER}
+      LR3_SUPERSET_DB_PASSWORD: ${LR3_SUPERSET_DB_PASSWORD:?Set LR3_SUPERSET_DB_PASSWORD}
+      LR3_SUPERSET_DB_NAME: ${LR3_SUPERSET_DB_NAME:?Set LR3_SUPERSET_DB_NAME}
+      LR3_SUPERSET_ADMIN_USER: ${LR3_SUPERSET_ADMIN_USER:?Set LR3_SUPERSET_ADMIN_USER}
+      LR3_SUPERSET_ADMIN_PASSWORD: ${LR3_SUPERSET_ADMIN_PASSWORD:?Set LR3_SUPERSET_ADMIN_PASSWORD}
+      LR3_SUPERSET_ADMIN_EMAIL: ${LR3_SUPERSET_ADMIN_EMAIL:?Set LR3_SUPERSET_ADMIN_EMAIL}
+    entrypoint: [python, /app/lab3/init_superset.py]
+    volumes:
+      - lr3-superset-home:/app/superset_home
+    depends_on:
+      lr3-superset-db:
+        condition: service_healthy
+    restart: "no"
+
+  lr3-superset:
+    build: ./docker/lab3/superset
+    image: lr3-superset:4.1.2
+    profiles: [lr3]
+    environment: *superset-env
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - lr3-superset-home:/app/superset_home
+    depends_on:
+      lr3-superset-init:
+        condition: service_completed_successfully
+
+  lr3-openmetadata-db:
+    image: postgres:16.6
+    profiles: [lr3]
+    environment:
+      POSTGRES_USER: ${LR3_OM_DB_USER:?Set LR3_OM_DB_USER}
+      POSTGRES_PASSWORD: ${LR3_OM_DB_PASSWORD:?Set LR3_OM_DB_PASSWORD}
+      POSTGRES_DB: ${LR3_OM_DB_NAME:?Set LR3_OM_DB_NAME}
+    volumes:
+      - lr3-openmetadata-db:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  lr3-opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    profiles: [lr3]
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+    volumes:
+      - lr3-opensearch:/usr/share/opensearch/data
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow\&timeout=2s > /dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  lr3-openmetadata-migrate:
+    image: openmetadata/server:1.8.0
+    profiles: [lr3]
+    environment: *openmetadata-env
+    working_dir: /opt/openmetadata
+    command: ["./bootstrap/openmetadata-ops.sh", "-d", "migrate", "--force"]
+    depends_on:
+      lr3-openmetadata-db:
+        condition: service_healthy
+      lr3-opensearch:
+        condition: service_healthy
+    restart: "no"
+
+  lr3-openmetadata:
+    image: openmetadata/server:1.8.0
+    profiles: [lr3]
+    environment: *openmetadata-env
+    ports:
+      - "127.0.0.1:8585:8585"
+    depends_on:
+      lr3-openmetadata-migrate:
+        condition: service_completed_successfully
+
+  # Ручной CLI, не управляемый сервером Airflow и не запускающий ingestion автоматически.
+  lr3-ingestion:
+    image: openmetadata/ingestion:1.8.0
+    profiles: [ingestion]
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["sleep infinity"]
+    volumes:
+      - lr3-ingestion:/opt/airflow/logs
+    depends_on:
+      lr3-openmetadata:
+        condition: service_started
+
+volumes:
+  lr3-superset-db:
+  lr3-superset-home:
+  lr3-openmetadata-db:
+  lr3-opensearch:
+  lr3-ingestion:
