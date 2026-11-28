@@ -1,0 +1,129 @@
+{
+  "postgres_service": "steam-postgres",
+  "postgres_database": "airflow",
+  "pipeline_service": {
+    "name": "steam-airflow",
+    "display_name": "Steam Airflow",
+    "description": "DAG-и Steam-платформы ЛР3"
+  },
+  "pipelines": [
+    {
+      "name": "steam_games_catalog_etl",
+      "description": "Загрузка каталога Steam в steam.ods_games",
+      "source_url": "http://localhost:8080/dags/steam_games_catalog_etl"
+    },
+    {
+      "name": "steam_reviews_collector",
+      "description": "Сбор отзывов Steam в steam.ods_reviews",
+      "source_url": "http://localhost:8080/dags/steam_reviews_collector"
+    },
+    {
+      "name": "steam_player_stats_etl",
+      "description": "Сбор онлайна в steam.ods_player_stats",
+      "source_url": "http://localhost:8080/dags/steam_player_stats_etl"
+    },
+    {
+      "name": "dds_game_dimensions_dag",
+      "description": "SCD2-измерения игр, жанров, разработчиков и издателей",
+      "source_url": "http://localhost:8080/dags/dds_game_dimensions_dag"
+    },
+    {
+      "name": "dds_review_dimensions_dag",
+      "description": "SCD2-измерения пользователей и отзывов",
+      "source_url": "http://localhost:8080/dags/dds_review_dimensions_dag"
+    },
+    {
+      "name": "dds_facts_dag",
+      "description": "Факты отзывов и активности игроков",
+      "source_url": "http://localhost:8080/dags/dds_facts_dag"
+    },
+    {
+      "name": "data_quality_checks",
+      "description": "Проверки качества DDS",
+      "source_url": "http://localhost:8080/dags/data_quality_checks"
+    },
+    {
+      "name": "build_marts_dag",
+      "description": "Пересборка витрин marts и DQ витрин",
+      "source_url": "http://localhost:8080/dags/build_marts_dag"
+    }
+  ],
+  "table_edges": [
+    ["steam.ods_games", "dds.dim_game"],
+    ["steam.ods_games", "dds.dim_genre"],
+    ["steam.ods_games", "dds.dim_developer"],
+    ["steam.ods_games", "dds.dim_publisher"],
+    ["steam.ods_games", "dds.bridge_game_genre"],
+    ["steam.ods_games", "dds.bridge_game_developer"],
+    ["steam.ods_games", "dds.bridge_game_publisher"],
+    ["dds.dim_game", "dds.bridge_game_genre"],
+    ["dds.dim_game", "dds.bridge_game_developer"],
+    ["dds.dim_game", "dds.bridge_game_publisher"],
+    ["dds.dim_genre", "dds.bridge_game_genre"],
+    ["dds.dim_developer", "dds.bridge_game_developer"],
+    ["dds.dim_publisher", "dds.bridge_game_publisher"],
+    ["steam.ods_reviews", "dds.dim_user"],
+    ["steam.ods_reviews", "dds.dim_review"],
+    ["dds.dim_review", "dds.fact_review"],
+    ["dds.dim_game", "dds.fact_review"],
+    ["dds.dim_user", "dds.fact_review"],
+    ["steam.ods_player_stats", "dds.fact_player_activity"],
+    ["dds.dim_game", "dds.fact_player_activity"],
+
+    ["dds.dim_game", "marts.mart_game_daily_metrics"],
+    ["dds.fact_review", "marts.mart_game_daily_metrics"],
+    ["dds.fact_player_activity", "marts.mart_game_daily_metrics"],
+    ["dds.dim_game", "marts.mart_activity_hourly"],
+    ["dds.fact_player_activity", "marts.mart_activity_hourly"],
+    ["marts.mart_game_daily_metrics", "marts.mart_genre_daily_metrics"],
+    ["dds.bridge_game_genre", "marts.mart_genre_daily_metrics"],
+    ["dds.dim_genre", "marts.mart_genre_daily_metrics"],
+    ["marts.mart_game_daily_metrics", "marts.mart_publisher_daily_metrics"],
+    ["dds.bridge_game_publisher", "marts.mart_publisher_daily_metrics"],
+    ["dds.dim_publisher", "marts.mart_publisher_daily_metrics"],
+
+    ["marts.mart_game_daily_metrics", "marts.bi_top15_games_by_avg_players"],
+    ["marts.mart_activity_hourly", "marts.bi_activity_dow_hour_utc"],
+    ["marts.mart_game_daily_metrics", "marts.bi_reviews_daily"],
+    ["marts.mart_genre_daily_metrics", "marts.bi_top_genres_by_reviews"],
+    ["marts.mart_genre_daily_metrics", "marts.bi_genre_sentiment"],
+    ["marts.mart_publisher_daily_metrics", "marts.bi_publisher_reviews_vs_online"]
+  ],
+  "pipeline_table_edges": [
+    ["steam_games_catalog_etl", "steam.ods_games"],
+    ["steam_reviews_collector", "steam.ods_reviews"],
+    ["steam_player_stats_etl", "steam.ods_player_stats"],
+    ["dds_game_dimensions_dag", "dds.dim_game"],
+    ["dds_game_dimensions_dag", "dds.dim_genre"],
+    ["dds_game_dimensions_dag", "dds.dim_developer"],
+    ["dds_game_dimensions_dag", "dds.dim_publisher"],
+    ["dds_game_dimensions_dag", "dds.bridge_game_genre"],
+    ["dds_game_dimensions_dag", "dds.bridge_game_developer"],
+    ["dds_game_dimensions_dag", "dds.bridge_game_publisher"],
+    ["dds_review_dimensions_dag", "dds.dim_user"],
+    ["dds_review_dimensions_dag", "dds.dim_review"],
+    ["dds_facts_dag", "dds.fact_review"],
+    ["dds_facts_dag", "dds.fact_player_activity"],
+    ["data_quality_checks", "dds.dq_results"],
+    ["build_marts_dag", "marts.mart_game_daily_metrics"],
+    ["build_marts_dag", "marts.mart_activity_hourly"],
+    ["build_marts_dag", "marts.mart_genre_daily_metrics"],
+    ["build_marts_dag", "marts.mart_publisher_daily_metrics"],
+    ["build_marts_dag", "marts.mart_dq_results"]
+  ],
+  "dashboard": {
+    "enabled": false,
+    "service_name": "steam-superset",
+    "name": "steam_analytics_lr3",
+    "display_name": "Steam Analytics (ЛР3)",
+    "source_url": "http://127.0.0.1:8088/superset/dashboard/steam-analytics-lr3/",
+    "table_edges": [
+      "marts.bi_top15_games_by_avg_players",
+      "marts.bi_activity_dow_hour_utc",
+      "marts.bi_reviews_daily",
+      "marts.bi_top_genres_by_reviews",
+      "marts.bi_genre_sentiment",
+      "marts.bi_publisher_reviews_vs_online"
+    ]
+  }
+}

@@ -1,0 +1,43 @@
+# ПЛЕЙСХОЛДЕР, НЕ ИСПОЛЬЗУЕТСЯ.
+#
+# OpenMetadata-коннектор Airflow рассчитан на схему метаданных Airflow 2.x
+# (в частности, на колонку serialized_dag.fileloc). Проект работает на
+# Airflow 3.3.2; фактическая совместимость коннектора OpenMetadata 1.8.0
+# с Airflow 3.3.2 не проверена и не заявляется.
+#
+# DAG-и регистрируются как pipeline-сущности декларативно:
+#   lab3/metadata/lineage/lineage.json
+#   lab3/metadata/lineage/apply_lineage.py
+#
+# Файл оставлен как образец рецепта, если коннектор когда-нибудь будет
+# проверен на совместимой версии.
+
+source:
+  type: airflow
+  serviceName: steam-airflow
+  serviceConnection:
+    config:
+      type: Airflow
+      hostPort: http://airflow-apiserver:8080
+      numberOfStatus: 10
+      connection:
+        type: Postgres
+        username: "__AIRFLOW_DB_USER__"
+        authType:
+          password: "__AIRFLOW_DB_PASSWORD__"
+        database: "__AIRFLOW_DB_NAME__"
+        hostPort: "__AIRFLOW_DB_HOST__:__AIRFLOW_DB_PORT__"
+  sourceConfig:
+    config:
+      type: PipelineMetadata
+
+sink:
+  type: metadata-rest
+  config: {}
+
+workflowConfig:
+  openMetadataServerConfig:
+    hostPort: http://lr3-openmetadata:8585/api
+    authProvider: openmetadata
+    securityConfig:
+      jwtToken: "__OM_JWT_TOKEN__"
