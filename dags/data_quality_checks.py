@@ -396,7 +396,7 @@ def write_dq_summary(**context) -> str:
     os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, "results.json")
     with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+        json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
 
     logger.info(f"DQ summary: {json.dumps(summary['status_counts'], ensure_ascii=False)}")
     return out_file
